@@ -9,31 +9,6 @@ import blkdev.utils, blkdev.raw
 import fs.utils, fs.ext4
 ###
 
-### Static Configs
-
-PKGS = [
-  # Administration
-  'doas', 'htop',
-    'eudev', # udev dropin replacement
-    'openssh', 'openssl', 'rsync',
-    'bash', 'fish',
-    'git', 'python3', 'bzip2',
-    'tar', 'gzip', 'xz', 'zip',
-    'grep', 'mawk', 'nano', 'less',
-  # Networking
-  'wireguard-tools', 'iproute2', 'nftables', 'tinydns', 'chrony',
-  'netcat-openbsd', 'tcpdump',  'iperf3', 'nmap',
-  # HTTP
-  'curl', 'ca-certificates', 'lighttpd', 'jq',
-  # Block & Filesystems
-  'lsblk', 'findmnt', 'lsof',
-    'lvm2', 'mdadm', 'cryptsetup', 'parted',
-    'e2fsprogs', 'dosfstools', 'xfsprogs', 'btrfs-progs', 'zfs',
-    'nvme-cli', 'smartmontools',
-]
-
-###
-
 supported_arch_t = Literal['x86_64', 'aarch64']
 supported_blkdev_t = Literal['raw']
 supported_fs_t = Literal['ext4']
@@ -216,8 +191,8 @@ def build_rootfs(cfg: BuildConfig) -> BuildResult:
       alpine.init(os_version, cfg['target_arch'], rootfs)
       logger.success('Alpine Initialized')
       logger.debug('Installing Packages')
-      alpine.install_pkgs(PKGS, cfg['target_arch'], rootfs)
-      logger.success(f'Packages Installed: {PKGS}')
+      alpine.install_pkgs(alpine.DEFAULT_PKGS, cfg['target_arch'], rootfs)
+      logger.success(f'Packages Installed: {alpine.DEFAULT_PKGS}')
     elif cfg['os']['release'] == 'ubuntu': raise NotImplementedError
     else: raise BuildError(f'Unsupported OS Release: {cfg["os"]["release"]}')
   except RuntimeError as e:

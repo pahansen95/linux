@@ -10,6 +10,27 @@ SUPPORTED_VERSIONS = [
   "3.19",
 ]
 
+DEFAULT_PKGS = [
+  # Administration
+  'doas', 'htop',
+    'eudev', # udev dropin replacement
+    'openssh', 'openssl', 'rsync',
+    'bash', 'fish',
+    'git', 'python3', 'bzip2',
+    'tar', 'gzip', 'xz', 'zip',
+    'grep', 'mawk', 'nano', 'less',
+  # Networking
+  'wireguard-tools', 'iproute2', 'nftables', 'tinydns', 'chrony',
+  'netcat-openbsd', 'tcpdump',  'iperf3', 'nmap', 'bind-tools',
+  # HTTP
+  'curl', 'ca-certificates', 'lighttpd', 'jq',
+  # Block & Filesystems
+  'lsblk', 'findmnt', 'lsof',
+    'lvm2', 'mdadm', 'cryptsetup', 'parted',
+    'e2fsprogs', 'dosfstools', 'xfsprogs', 'btrfs-progs', 'zfs',
+    'nvme-cli', 'smartmontools',
+]
+
 def is_version_supported(version: str) -> str:
   """Returns a normalized version string if supported, otherwise an empty string for boolean evaluation"""
   _version = version.lower().strip().lstrip('v')
