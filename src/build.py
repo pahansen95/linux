@@ -243,7 +243,8 @@ def main():
   buf_offset = 0
   while buf_offset < buf_len: buf_offset += sys.stdout.buffer.write(buf[0:])
 
-  cleanup_blkdevs(build_result)
+  _cleanup = '--no-cleanup' not in sys.argv
+  if _cleanup: cleanup_blkdevs(build_result)
 
 if __name__ == '__main__':
   logger.remove()

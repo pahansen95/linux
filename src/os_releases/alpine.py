@@ -93,6 +93,10 @@ def init(
       )
       if proc.returncode != 0: raise RuntimeError(f'Failed to Extract APK for `{pkg}`')
 
+  ## Remove unused Artifacts from APK Fetch
+  (rootfs / '.PKGINFO').unlink()
+  (rootfs / '.SIGN.RSA.*').unlink()
+
   logger.debug("Initializing APK Database in the Root Filesystem")
   proc = subprocess.run(
     [

@@ -241,7 +241,8 @@ case "${1:?Missing Subcommand}" in
       build )
         log "Remotely building the Alpine Image"
         _ssh "install -dm0755 /mnt/build /mnt/build/rootfs"
-        _ssh "source /root/.venv/bin/activate && ( cd /root/image-builder/src && python3 build.py )"
+        declare _arg_list; _arg_list="$(printf -- "%q " "${@:3}")"
+        _ssh "source /root/.venv/bin/activate && ( cd /root/image-builder/src && python3 build.py ${_arg_list})"
         log "Remote build complete"
         ;;
       cleanup-build )
