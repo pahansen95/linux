@@ -1,0 +1,5 @@
+.cffibuild
+__pycache__
+.venv
+.user.env
+.cache
