@@ -17,3 +17,8 @@ def wipe(
     stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr,
   )
   if proc.returncode != 0: raise RuntimeError(f"Failed to wipe block device: {device_path.as_posix()}")
+
+def compress(
+  rootfs: pathlib.Path,
+  output: pathlib.Path,  
+): raise NotImplementedError

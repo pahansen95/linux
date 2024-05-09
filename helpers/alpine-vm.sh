@@ -235,20 +235,24 @@ case "${1:?Missing Subcommand}" in
         log "Installing Project Dependencies"
         _ssh "source /root/.venv/bin/activate && pip install -r /root/image-builder/src/requirements.txt"
         _ssh "apk add qemu qemu-system-${alpine_arch} qemu-tools qemu-img"
-        _ssh "apk add losetup parted wipefs lvm2 btrfs-progs dosfstools e2fsprogs f2fs-tools xfsprogs ntfs-3g"
+        _ssh "apk add umount losetup parted wipefs lvm2 btrfs-progs dosfstools e2fsprogs f2fs-tools xfsprogs ntfs-3g"
+        _ssh "apk add tar gzip xz bzip2 lzip zstd"
+        _ssh "apk add cpio squashfs-tools"
+        # Kernel Build Dependencies: See https://gitlab.alpinelinux.org/alpine/aports/-/blob/3.19-stable/main/linux-lts/APKBUILD?ref_type=heads#L13-15
+        _ssh "apk add make build-base initramfs-generator perl gmp-dev mpc1-dev mpfr-dev elfutils-dev bash flex bison zstd sed installkernel bc linux-headers linux-firmware-any openssl-dev>3 mawk diffutils findutils zstd pahole python3 gcc>=13.1.1_git20230624"
         log "Project Dependencies have been installed"
         ;;
       build )
         log "Remotely building the Alpine Image"
         _ssh "install -dm0755 /mnt/build /mnt/build/rootfs"
         declare _arg_list; _arg_list="$(printf -- "%q " "${@:3}")"
-        _ssh "source /root/.venv/bin/activate && ( cd /root/image-builder/src && python3 build.py ${_arg_list})"
+        _ssh "source /root/.venv/bin/activate && ( cd /root/image-builder/src && LOG_LEVEL=${LOG_LEVEL:-INFO} python3 build.py ${_arg_list})"
         log "Remote build complete"
         ;;
       cleanup-build )
         log "Cleaning up the Remote Build Directory"
-        _ssh "set -x; cut -f1 -d' ' /proc/mounts | grep -F /mnt/build | xargs -r -n 1 -P \$(nproc) umount"
-        _ssh "set -x; losetup -D"
+        _ssh "set -x; umount --verbose --recursive /mnt/build/rootfs || true"
+        _ssh "set -x; losetup -D || true"
         _ssh "set -x; install -dm0755 /mnt/build /tmp/empty && rsync -a --delete /tmp/empty/ /mnt/build/"
         log "Remote Build Directory has been cleaned up"
         ;;

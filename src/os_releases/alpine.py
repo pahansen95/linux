@@ -1,6 +1,7 @@
 import subprocess, io, sys, os, shutil, pathlib, tempfile
 from loguru import logger
 
+
 APK_DEFAULT_REPOS = """
 http://dl-cdn.alpinelinux.org/alpine/v{version}/main
 # http://dl-cdn.alpinelinux.org/alpine/v{version}/community
@@ -95,7 +96,7 @@ def init(
 
   ## Remove unused Artifacts from APK Fetch
   (rootfs / '.PKGINFO').unlink()
-  (rootfs / '.SIGN.RSA.*').unlink()
+  for f in rootfs.glob('.SIGN.RSA.*'): f.unlink()
 
   logger.debug("Initializing APK Database in the Root Filesystem")
   proc = subprocess.run(

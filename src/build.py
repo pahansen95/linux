@@ -1,87 +1,22 @@
+from __future__ import annotations
 from typing import TypedDict, Required, NotRequired, Literal
 from loguru import logger
-import pathlib, re, sys, os, platform, orjson, uuid
+import pathlib, re, sys, os, platform, orjson, uuid, tempfile
 
 ### Local src imports
+import configs.alpine
+import configs.default
 import utils
+import schemas
 import os_releases.alpine as alpine
 import blkdev.utils, blkdev.raw
 import fs.utils, fs.ext4
+import artifact.tar
+import configs
+import kernel.utils, kernel.alpine
 ###
 
-supported_arch_t = Literal['x86_64', 'aarch64']
-supported_blkdev_t = Literal['raw']
-supported_fs_t = Literal['ext4']
-supported_osrel_t = Literal['alpine']
-
-class BuildError(RuntimeError): ...
-
-class BlkDevCfg(TypedDict):
-  """TODO: Breakout Partition/Filesystem Configs"""
-  kind: supported_blkdev_t
-  """The kind of Block Device to create"""
-  path: str
-  """Path to create the Image Path"""
-  size: str
-  """Human readable Size of the Block Device"""
-  fs_type: supported_fs_t
-  """The Filesystem Type to format the Block Device as"""
-  volume_label: str
-  """The Label to assign to the Filesystem"""
-  fs_uuid: NotRequired[str]
-  """(Optional) The UUID to assign to the Filesystem"""
-  mount_point: str
-  """Path to mount the Block Device"""
-
-class BlkDevStatus(TypedDict):
-  size_bytes: int
-  """The size of the Block Device in bytes"""
-  kind: supported_blkdev_t
-  """The backing kind of the Block Device"""
-  img_path: str
-  """Path to the Block Device File"""
-  device_path: str
-  """The `/dev/` path to the attached block device"""
-  device_info: dict[str, str]
-  """Device Specific Information"""
-  fs_label: str
-  """The Label assigned to the Filesystem"""
-  fs_uuid: str
-  """The UUID assigned to the Filesystem"""
-  fs_info: dict[str, str]
-  """Filesystem Specific Information"""
-  mount_point: str
-  """Path to where the Block Device is mounted"""
-  mount_info: dict[str, str]
-  """Mount Backend Specific Information"""
-
-class OSConfig(TypedDict):
-  release: supported_osrel_t
-  """What OS Release to build"""
-  version: str
-  """What version of the OS to build for"""
-
-class BuildConfig(TypedDict):
-  target_arch: supported_arch_t
-  """The target architecture to build for"""
-  os: OSConfig
-  """The OS to build for"""
-  rootfs: str
-  """The path of the rootfs being built"""
-  block_devices: list[BlkDevCfg]
-  """The Block Devices to Configure"""
-
-class BuildResult(TypedDict):
-  block_devices: list[BlkDevStatus]
-  """The Runtime State for each Block Device ordered by the configuration"""
-
-  @staticmethod
-  def json_default(obj) -> object:
-    if isinstance(obj, pathlib.Path): return obj.as_posix()
-    elif isinstance(obj, uuid.UUID): return str(obj)
-    else: return obj
-
-def safe_cleanup_blkdev(dev: BlkDevStatus) -> None:
+def safe_cleanup_blkdev(dev: schemas.BlkDevStatus) -> None:
   """Cleanup the Block Device & Mount Points without failing"""
   logger.info(f"Cleaning up Block Device: {dev['img_path']}")
   device_path = pathlib.Path(dev['device_path'])
@@ -113,7 +48,7 @@ def safe_cleanup_blkdev(dev: BlkDevStatus) -> None:
   
   logger.success(f"Block Device Cleaned Up: {dev['img_path']}")
 
-def build_blkdevs(cfg: BuildConfig) -> BuildResult:
+def build_blkdevs(cfg: schemas.BuildConfig) -> schemas.BuildResult:
   """Creates & Setup the Block Devices"""
   logger.info("Building Block Devices")
 
@@ -124,7 +59,7 @@ def build_blkdevs(cfg: BuildConfig) -> BuildResult:
     dev_size = utils.convert_to_bytes(dev['size'])
     mount_path = pathlib.Path(dev['mount_point'])
     fs_uuid = uuid.UUID(dev['fs_uuid']) if 'fs_uuid' in dev else None
-    dev_status: BlkDevStatus = { # Fill in defaults, but we expect the operations to override
+    dev_status: schemas.BlkDevStatus = { # Fill in defaults, but we expect the operations to override
       "size_bytes": dev_size,
       "kind": dev['kind'],
       "img_path": img_path.as_posix(),
@@ -170,38 +105,158 @@ def build_blkdevs(cfg: BuildConfig) -> BuildResult:
 
   return { "block_devices": devs }
 
-def cleanup_blkdevs(build_result: BuildResult) -> None:
+def cleanup_blkdevs(build_result: schemas.BuildResult) -> None:
   for dev in build_result['block_devices']:
     safe_cleanup_blkdev(dev)
     
-def build_rootfs(cfg: BuildConfig) -> BuildResult:
+def build_rootfs(cfg: schemas.BuildConfig) -> tuple[schemas.RootFSConfig, schemas.RootFSStatus]:
   """Writes the RootFS for the target architecture onto the specified target"""
   logger.info('Building the RootFS')
 
-  logger.debug('Checking for RootFS Path')
-  rootfs = pathlib.Path(cfg['rootfs'])
-  if not (rootfs.exists() and rootfs.is_dir()): raise BuildError(f'Rootfs path does not exist or is not a directory: {rootfs.as_posix()}')
-  logger.success(f'Target RootFS located at {rootfs.as_posix()}')
+  def _build_rootfs(rootfs: pathlib.Path) -> schemas.RootFSStatus:
+    logger.debug(f'Checking for RootFS Path: {rootfs.as_posix()}')
+    if not (rootfs.exists() and rootfs.is_dir()): raise BuildError(f'Rootfs path does not exist or is not a directory: {rootfs.as_posix()}')
+    logger.success(f'Target RootFS located at {rootfs.as_posix()}')
 
-  try:
-    os_release = cfg['os']['release'].lower()
-    if os_release == 'alpine':
-      if not (os_version := alpine.is_version_supported(cfg['os']['version'])): raise BuildError(f'Unsupported Alpine Version: {cfg["os"]["version"]}')
-      logger.debug('Initializing Alpine')
-      alpine.init(os_version, cfg['target_arch'], rootfs)
-      logger.success('Alpine Initialized')
-      logger.debug('Installing Packages')
-      alpine.install_pkgs(alpine.DEFAULT_PKGS, cfg['target_arch'], rootfs)
-      logger.success(f'Packages Installed: {alpine.DEFAULT_PKGS}')
-    elif cfg['os']['release'] == 'ubuntu': raise NotImplementedError
-    else: raise BuildError(f'Unsupported OS Release: {cfg["os"]["release"]}')
-  except RuntimeError as e:
-    raise BuildError(f'Failed to build rootfs: {e}')
+    try:
+      os_release = cfg['os']['release'].lower()
+      if os_release == 'alpine':
+        if not (os_version := alpine.is_version_supported(cfg['os']['version'])): raise BuildError(f'Unsupported Alpine Version: {cfg["os"]["version"]}')
+        logger.debug('Initializing Alpine')
+        alpine.init(os_version, cfg['target_arch'], rootfs)
+        logger.success('Alpine Initialized')
+        logger.debug('Installing Packages')
+        alpine.install_pkgs(alpine.DEFAULT_PKGS, cfg['target_arch'], rootfs)
+        logger.success(f'Packages Installed: {alpine.DEFAULT_PKGS}')
+      else: raise BuildError(f'Unsupported OS Release: {cfg["os"]["release"]}')
+    except RuntimeError as e:
+      raise BuildError(f'Failed to build rootfs: {e}')
 
-  logger.success('RootFS Build Complete')
+    logger.success('RootFS Build Complete')
+    return {
+      'fmt': cfg['rootfs']['fmt'],
+      'build_path': rootfs.as_posix(),
+    }
+
+  if 'build_path' in cfg['rootfs']: build_dir = pathlib.Path(cfg['rootfs']['build_path'])
+  else: build_dir = pathlib.Path(tempfile.mkdtemp(dir=cfg['workdir']))
+  return (
+    cfg['rootfs'] | { 'build_path': build_dir.as_posix() },
+    { 'rootfs': _build_rootfs(build_dir) }
+  )
+
+def package_rootfs(cfg: schemas.BuildConfig) -> schemas.BuildResult:
+  """Package the RootFS into an artifact"""
+  src_path = pathlib.Path(cfg['rootfs']['build_path'])
+  dst_path = pathlib.Path(cfg['rootfs']['artifact_path'])
+  logger.info(f'Packaging the RootFS: {dst_path.as_posix()}')
+
+  _artifat_status: schemas.ArtifactStatus = {}
+  if cfg['rootfs']['fmt'].startswith('tar.'): _artifat_status |= artifact.tar.create(src_path, dst_path, cfg['rootfs']['fmt'].split('.', maxsplit=1)[1])
+  elif cfg['rootfs']['fmt'] == 'tar': _artifat_status |= artifact.tar.create(src_path, dst_path, None)
+  else: raise BuildError(f'Unsupported RootFS Artifact Format: {cfg["rootfs"]["fmt"]}')
+
+  return { 'artifacts': [_artifat_status] }
+
+def deploy_rootfs(
+  cfg: schemas.BuildConfig,
+  rootfs_artifact: schemas.ArtifactStatus,
+) -> schemas.BuildResult:
+  """Deploys the RootFS from the artifact to the mount directory of the root disk
+  
+  The First Block Device is assumed to be the root disk
+  """
+  if len(cfg['block_devices']) > 1: raise NotImplementedError('Only a single block device is supported for deployment')
+  artifact_file = pathlib.Path(rootfs_artifact['path'])
+  mount_point = pathlib.Path(cfg['block_devices'][0]['mount_point'])
+
+  if not artifact_file.exists(): raise BuildError(f'RootFS Artifact does not exist: {artifact_file.as_posix()}')
+  if not (mount_point.exists() and mount_point.resolve().is_dir()): raise BuildError(f'Bloc Device Mount Point does not exist or is not a directory: {mount_point.as_posix()}')
+
+  logger.info(f'Deploying RootFS from {artifact_file.as_posix()} to {mount_point.as_posix()}')
+
+  if cfg['rootfs']['fmt'].startswith('tar.'): artifact.tar.extract(artifact_file, mount_point, rootfs_artifact['hash'], cfg['rootfs']['fmt'].split('.', maxsplit=1)[1])
+  elif cfg['rootfs']['fmt'] == 'tar': artifact.tar.extract(artifact_file, mount_point, rootfs_artifact['hash'], None)
+  else: raise BuildError(f'Unsupported RootFS Artifact Format: {cfg["rootfs"]["fmt"]}')
+
   return {}
 
-def main():
+def build_kernel(
+  # ...
+) -> ...:
+  """Build the Linux Kernel
+  
+  !!! NOTE: Under Development !!!
+  """
+  target_arch = 'x86_64'
+  kernel_version = 'v6.6.30' # Current Stable
+  aports_ref = '3.19-stable'
+  kernel_build_semver = f'{kernel_version.lstrip("v")}+alpine-{aports_ref}'
+  kernel_build_kind = 'lts'
+
+  logger.info(f'Building Kernel: {kernel_version}')
+
+  with tempfile.TemporaryDirectory() as tmpdir:
+    workdir = pathlib.Path(tmpdir)
+
+    ### Fetch the Kernel Source
+
+    (kernel_src := workdir / f'linux-{kernel_version}').mkdir(mode=0o755, parents=False, exist_ok=True)
+    logger.debug(f'Fetching Kernel Source: {kernel_version}')
+    (
+      _kernel_src,
+      _kernel_archive,
+    ) = kernel.utils.fetch_src(kernel_version, workdir, kernel_src)
+    assert _kernel_src.as_posix() == kernel_src.as_posix(), f'{_kernel_src.as_posix()} != {kernel_src.as_posix()}'
+    logger.debug(f'Kernel Source `{_kernel_archive.as_posix()}` extracted to `{kernel_src.as_posix()}`')
+    logger.success(f'Kernel Source Fetched: {kernel_version}')
+
+    ### Fetch the build info
+
+    (build_info_src := workdir / 'alpine-kernel').mkdir(mode=0o755, parents=False, exist_ok=True)
+    logger.debug(f'Fetching Alpine Linux Kernel Package Build Info: {aports_ref}')
+    (
+      _build_info_src,
+      _build_info_archive,
+    ) = kernel.alpine.fetch_build_info(aports_ref, workdir, build_info_src)
+    assert _build_info_src.as_posix() == build_info_src.as_posix(), f'{_build_info_src.as_posix()} != {build_info_src.as_posix()}'
+    logger.debug(f'Alpine Linux Kernel Package Build Info `{_build_info_archive.as_posix()}` extracted to `{build_info_src.as_posix()}`')
+    logger.success(f'Alpine Linux Kernel Package Build Info Fetched: {aports_ref}')
+
+    ### Prepare the Kernel Build
+    logger.info('Preparing Kernel Build')
+
+    logger.info('Cleaning Kernel Source')
+    kernel.utils.clean(
+      kernel_src_dir=kernel_src,
+    )
+    logger.success('Kernel Source Cleaned')
+
+    logger.info('Applying Alpine Linux Kernel Build Info')
+    kernel.alpine.apply_build_info(
+      build_info_src=build_info_src,
+      kernel_src=kernel_src,
+      build_kind=kernel_build_kind,
+      build_arch=target_arch,
+    )
+    logger.success('Alpine Linux Kernel Build Info Applied')
+
+    ### Build the Kernel
+    logger.info('Building the Kernel')
+
+    logger.info('Building vmlinux')
+    kernel.utils.build_vmlinux(
+      kernel_src_dir=kernel_src,
+      target_arch=target_arch,
+      build_version=kernel_build_semver,
+    )
+    logger.success('vmlinux Built')
+
+    # kernel.alpine.build(_extract_dir, workdir)
+  
+  raise NotImplementedError
+
+def main() -> int:
   logger.debug('Checking for an AlpineLinux Environment')
   if not re.search(r'ID=alpine', pathlib.Path('/etc/os-release').read_text()): raise BuildError('Not running in an Alpine environment')
   logger.success("AlpineLinux Environment Detected")
@@ -210,49 +265,93 @@ def main():
   if not os.getuid() == 0: raise BuildError('Must run as root')
   logger.success('Running as Root')
 
-  build_cfg: BuildConfig = {
-    'target_arch': platform.machine(),
-    'os': {
-      'release': 'alpine',
-      'version': '3.19',
-    },
-    'rootfs': '/mnt/build/rootfs',
-    'block_devices': [
-      {
-        "kind": "raw",
-        "path": "/mnt/build/rootfs.img",
-        "size": "4GiB",
-        "fs_type": "ext4",
-        "volume_label": "ROOT",
-        # Let the UUID be auto-generated
-        "mount_point": "/mnt/build/rootfs",
-      }
-    ]
-  }
-  build_result: BuildResult = {}
 
-  build_result |= build_blkdevs(build_cfg)
-  try:
-    build_result |= build_rootfs(build_cfg)
-  except:
-    cleanup_blkdevs(build_result)
-    raise
+  ### NOTE: Development
+  build_kernel()
+  ###
+
+  build_cfg: schemas.BuildConfig = None
+  build_cfg_json = sys.stdin.read().strip()
+  if build_cfg_json: build_cfg = orjson.loads(build_cfg_json, object_hook=schemas.BuildConfig)
+  else: build_cfg = configs.default.assemble() | configs.alpine.assemble()
+  assert build_cfg is not None
+  logger.info(f"Using Build Configuration...\n{orjson.dumps(build_cfg, option=orjson.OPT_INDENT_2).decode()}")
+
+  build_result: schemas.BuildResult = {
+    'rootfs': None,
+    'block_devices': [],
+    'artifacts': [],
+  }
+  (patched_cfg, status) = build_rootfs(build_cfg)
+  build_cfg['rootfs'] |= patched_cfg
+  build_result['rootfs'] = status
+  build_result['artifacts'].extend(package_rootfs(build_cfg)['artifacts'])
+  if 'block_devices' in build_cfg:
+    try:
+      build_result['block_devices'].extend(build_blkdevs(build_cfg)['block_devices'])
+      build_result |= deploy_rootfs(build_cfg, build_result['artifacts'][0]) # We assume the first artifact is the rootfs
+    finally: 
+      if '--no-cleanup' not in sys.argv: cleanup_blkdevs(build_result)
   
-  buf = orjson.dumps(build_result, default=BuildResult.json_default, option=orjson.OPT_APPEND_NEWLINE)
+  buf = orjson.dumps(build_result, default=schemas.BuildResult.json_default, option=orjson.OPT_APPEND_NEWLINE)
   buf_len = len(buf)
   buf_offset = 0
   while buf_offset < buf_len: buf_offset += sys.stdout.buffer.write(buf[0:])
 
-  _cleanup = '--no-cleanup' not in sys.argv
-  if _cleanup: cleanup_blkdevs(build_result)
+  return 0
+
+# if __name__ == '__main__':
+#   _rc = 1
+#   logger.remove()
+#   logger.add(sys.stderr, level=os.environ.get('LOG_LEVEL', 'DEBUG'), enqueue=True, colorize=True)
+#   try: _rc = main()
+#   except BuildError as e: logger.error(f'Build Failed: {e}')
+#   except Exception as e: logger.opt(exception=e).critical("Unhandled Exception")
+#   finally:
+#     logger.complete()
+#     sys.stderr.flush()
+#     sys.stdout.flush()
+#     exit(_rc)
+
+class BuildError(RuntimeError): ...
+class CLIError(RuntimeError): ...
+def load_from_env(name: str) -> str:
+  try:
+    val = os.environ[name]
+    if not val: raise KeyError()
+    return val
+  except KeyError: raise CLIError(f"Missing or Empty Environment Variable: {name}")
+def write_to_stdout(data: bytes):
+  buf_len = len(data)
+  bytes_written = 0
+  while bytes_written < buf_len: bytes_written += sys.stdout.buffer.write(data[bytes_written:])
+def setup_logging():
+  logger.remove()
+  logger.add(sink=sys.stderr, level=os.environ.get('LOG_LEVEL', 'INFO'), enqueue=True, colorize=True)
+def finalize():
+  logger.complete()
+  sys.stderr.flush()
+  sys.stdout.flush()
+def _build_error(e: Exception):
+  logger.error(f'Build Failed: {e}')
+  return 1
+def _cli_error(e: Exception):
+  logger.error(e)
+  return 2
+def _unhandled_error(e: Exception):
+  logger.opt(exception=e).critical('Unhandled exception')
+  return 3
+def _interrupt_error():
+  logger.warning("Interrupt Detected, Exiting...")
+  return 4
 
 if __name__ == '__main__':
-  logger.remove()
-  logger.add(sys.stderr, level=os.environ.get('LOG_LEVEL', 'DEBUG'), enqueue=True, colorize=True)
-  try: main()
-  except BuildError as e: logger.error(f'Build Failed: {e}')
-  except Exception as e: logger.opt(exception=e).critical("Unhandled Exception")
-  finally:
-    logger.complete()
-    sys.stderr.flush()
-    sys.stdout.flush()
+  _rc = 255
+  setup_logging()
+  try: _rc = main()
+  except (KeyboardInterrupt, SystemExit): _rc = _interrupt_error()
+  except CLIError as e: _rc = _cli_error(e)
+  except BuildError as e: _rc = _build_error(e)
+  except Exception as e: _rc = _unhandled_error(e)
+  finally: finalize()
+  sys.exit(_rc)
