@@ -29,6 +29,7 @@ _get_next_open_port() {
 
 _set_vm_opts() {
   log "Alpine Version: ${alpine_ver}" "Alpine Architecture: ${alpine_arch}" "Cache Directory: ${cache_dir}"
+  declare -g _qemu_system; _qemu_system="$(command -v "qemu-system-${alpine_arch}")"
   declare -gi ssh_port; _get_next_open_port ssh_port
   printf '%s\n' "${ssh_port}" > "${cache_dir}/ssh.port"
   declare -gA qemu_net_user_opts=(
@@ -48,6 +49,14 @@ _set_vm_opts() {
   declare -g _net_user_opts; _net_user_opts="$(printf '%s,' "${MAPFILE[@]}")"; _net_user_opts="${_net_user_opts%,}"; declare -r _net_user_opts
   # declare uefi_firmware="/home/linuxbrew/.linuxbrew/share/qemu/edk2-${alpine_arch}-code.fd"
   declare -g uefi_firmware="/usr/share/OVMF/OVMF_CODE.fd"
+  [[ -f "${uefi_firmware}" ]] || (
+    export DEBIAN_FRONTEND=noninteractive
+    export TZ="${TZ:-UTC}"
+    { sudo apt-get update && sudo apt-get install -y ovmf; } || {
+      log "Failed to Install OVMF"
+      exit 1
+    }
+  )
   [[ -f "${uefi_firmware}" ]] || {
     log "Missing EUFI Firmware: ${uefi_firmware}"
     exit 1
@@ -55,6 +64,16 @@ _set_vm_opts() {
   declare -g accel
   if [[ -c /dev/kvm ]]; then
     accel="kvm"
+    declare kvm_group; kvm_group="$(stat -c '%G' /dev/kvm)"
+    # Check if user is in the kvm group
+    {
+      getent group "${kvm_group}" | grep -q "$(id -un)"
+    } || {
+      log "Adding User to the kvm Group"
+      sudo usermod -aG "${kvm_group}" "$(id -un)"
+      log "Please logout and login again to use KVM Acceleration"
+      exit 1
+    }
   else
     accel="tcg"
   fi
@@ -64,7 +83,7 @@ exec_installer_vm() {
   log "Dropping into an Interactive Session w/ the Alpine Installer"
   _set_vm_opts
   set -x
-  exec "qemu-system-${alpine_arch}" \
+  exec sudo $_qemu_system \
     -name "alpine-image-builder" \
     -machine "type=q35,accel=${accel}" \
     -bios "${uefi_firmware}" \
@@ -88,9 +107,9 @@ fork_builder_vm() {
   (
     _set_vm_opts
     set -x
-    "qemu-system-${alpine_arch}" \
+    sudo $_qemu_system \
       -name "alpine-image-builder" \
-      -machine type=q35,accel=tcg \
+      -machine "type=q35,accel=${accel}" \
       -bios "${uefi_firmware}" \
       -smp "cpus=4" \
       -m "size=$(( 16 * 1024 ))" \
@@ -235,24 +254,20 @@ case "${1:?Missing Subcommand}" in
         log "Installing Project Dependencies"
         _ssh "source /root/.venv/bin/activate && pip install -r /root/image-builder/src/requirements.txt"
         _ssh "apk add qemu qemu-system-${alpine_arch} qemu-tools qemu-img"
-        _ssh "apk add umount losetup parted wipefs lvm2 btrfs-progs dosfstools e2fsprogs f2fs-tools xfsprogs ntfs-3g"
-        _ssh "apk add tar gzip xz bzip2 lzip zstd"
-        _ssh "apk add cpio squashfs-tools"
-        # Kernel Build Dependencies: See https://gitlab.alpinelinux.org/alpine/aports/-/blob/3.19-stable/main/linux-lts/APKBUILD?ref_type=heads#L13-15
-        _ssh "apk add make build-base initramfs-generator perl gmp-dev mpc1-dev mpfr-dev elfutils-dev bash flex bison zstd sed installkernel bc linux-headers linux-firmware-any openssl-dev>3 mawk diffutils findutils zstd pahole python3 gcc>=13.1.1_git20230624"
+        _ssh "apk add losetup parted wipefs lvm2 btrfs-progs dosfstools e2fsprogs f2fs-tools xfsprogs ntfs-3g"
         log "Project Dependencies have been installed"
         ;;
       build )
         log "Remotely building the Alpine Image"
         _ssh "install -dm0755 /mnt/build /mnt/build/rootfs"
         declare _arg_list; _arg_list="$(printf -- "%q " "${@:3}")"
-        _ssh "source /root/.venv/bin/activate && ( cd /root/image-builder/src && LOG_LEVEL=${LOG_LEVEL:-INFO} python3 build.py ${_arg_list})"
+        _ssh "source /root/.venv/bin/activate && ( cd /root/image-builder/src && python3 build.py ${_arg_list})"
         log "Remote build complete"
         ;;
       cleanup-build )
         log "Cleaning up the Remote Build Directory"
-        _ssh "set -x; umount --verbose --recursive /mnt/build/rootfs || true"
-        _ssh "set -x; losetup -D || true"
+        _ssh "set -x; cut -f1 -d' ' /proc/mounts | grep -F /mnt/build | xargs -r -n 1 -P \$(nproc) umount"
+        _ssh "set -x; losetup -D"
         _ssh "set -x; install -dm0755 /mnt/build /tmp/empty && rsync -a --delete /tmp/empty/ /mnt/build/"
         log "Remote Build Directory has been cleaned up"
         ;;
