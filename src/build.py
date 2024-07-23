@@ -182,79 +182,148 @@ def deploy_rootfs(
   return {}
 
 def build_kernel(
-  # ...
-) -> ...:
+  cfg: schemas.BuildConfig,
+) -> schemas.KernelCfg:
   """Build the Linux Kernel
   
   !!! NOTE: Under Development !!!
   """
-  target_arch = 'x86_64'
-  kernel_version = 'v6.6.30' # Current Stable
-  aports_ref = '3.19-stable'
-  kernel_build_semver = f'{kernel_version.lstrip("v")}+alpine-{aports_ref}'
-  kernel_build_kind = 'lts'
+  workdir = pathlib.Path(cfg['workdir'])
+  (build_outputs := workdir / 'linux-build-outputs').mkdir(mode=0o755, parents=False, exist_ok=True)
+  kernel_src = pathlib.Path(cfg['kernel']['path'])
+  patch_src = pathlib.Path(cfg['kernel']['patch_path'])
+  target_arch = cfg['target_arch']
+  kernel_version = cfg['kernel']['version'].lstrip("v")
+  if cfg['kernel']['patch_src'] == 'alpine':
+    kernel_patch_ref = cfg['kernel']['patch_ref']
+    kernel_patch_kind = cfg['kernel']['patch_kind']
+    kernel_build_semver = f"{kernel_version}+{cfg['kernel']['patch_src']}-{kernel_patch_ref}"
+  else: raise NotImplementedError(f'Unsupported Kernel Patch Source: {cfg["kernel"]["patch_src"]}')
 
   logger.info(f'Building Kernel: {kernel_version}')
 
-  with tempfile.TemporaryDirectory() as tmpdir:
-    workdir = pathlib.Path(tmpdir)
+  ### Fetch the Kernel Source
 
-    ### Fetch the Kernel Source
+  # (kernel_src := workdir / f'linux-{kernel_version}').mkdir(mode=0o755, parents=False, exist_ok=True)
+  logger.debug(f'Fetching Kernel Source: {kernel_version}')
+  (
+    _kernel_src,
+    _kernel_archive,
+  ) = kernel.utils.fetch_src(
+    version=kernel_version,
+    workdir=workdir,
+    dest_dir=kernel_src,
+  )
+  assert _kernel_src.as_posix() == kernel_src.as_posix(), f'{_kernel_src.as_posix()} != {kernel_src.as_posix()}'
+  logger.debug(f'Kernel Source `{_kernel_archive.as_posix()}` extracted to `{kernel_src.as_posix()}`')
+  logger.success(f'Kernel Source Fetched: {kernel_version}')
 
-    (kernel_src := workdir / f'linux-{kernel_version}').mkdir(mode=0o755, parents=False, exist_ok=True)
-    logger.debug(f'Fetching Kernel Source: {kernel_version}')
-    (
-      _kernel_src,
-      _kernel_archive,
-    ) = kernel.utils.fetch_src(kernel_version, workdir, kernel_src)
-    assert _kernel_src.as_posix() == kernel_src.as_posix(), f'{_kernel_src.as_posix()} != {kernel_src.as_posix()}'
-    logger.debug(f'Kernel Source `{_kernel_archive.as_posix()}` extracted to `{kernel_src.as_posix()}`')
-    logger.success(f'Kernel Source Fetched: {kernel_version}')
+  ### Fetch the build info
 
-    ### Fetch the build info
+  # (patch_src := workdir / 'alpine-kernel').mkdir(mode=0o755, parents=False, exist_ok=True)
+  logger.debug(f'Fetching Alpine Linux Kernel Package Patch: {kernel_patch_ref}')
+  (
+    _patch_src,
+    _patch_archive,
+  ) = kernel.alpine.fetch_build_info(
+    ref=kernel_patch_ref,
+    workdir=workdir,
+    dest_dir=patch_src,
+  )
+  assert _patch_src.as_posix() == patch_src.as_posix(), f'{_patch_src.as_posix()} != {patch_src.as_posix()}'
+  logger.debug(f'Alpine Linux Kernel Package Build Info `{_patch_archive.as_posix()}` extracted to `{patch_src.as_posix()}`')
+  logger.success(f'Alpine Linux Kernel Package Build Info Fetched: {kernel_patch_ref}')
 
-    (build_info_src := workdir / 'alpine-kernel').mkdir(mode=0o755, parents=False, exist_ok=True)
-    logger.debug(f'Fetching Alpine Linux Kernel Package Build Info: {aports_ref}')
-    (
-      _build_info_src,
-      _build_info_archive,
-    ) = kernel.alpine.fetch_build_info(aports_ref, workdir, build_info_src)
-    assert _build_info_src.as_posix() == build_info_src.as_posix(), f'{_build_info_src.as_posix()} != {build_info_src.as_posix()}'
-    logger.debug(f'Alpine Linux Kernel Package Build Info `{_build_info_archive.as_posix()}` extracted to `{build_info_src.as_posix()}`')
-    logger.success(f'Alpine Linux Kernel Package Build Info Fetched: {aports_ref}')
+  ### Prepare the Kernel Build
+  logger.info('Preparing Kernel Build')
 
-    ### Prepare the Kernel Build
-    logger.info('Preparing Kernel Build')
+  logger.info('Cleaning Kernel Source')
+  kernel.utils.clean(
+    kernel_src_dir=kernel_src,
+    target_arch=target_arch,
+    build_version=kernel_build_semver,
+    build_out_dir=build_outputs,
+  )
+  logger.success('Kernel Source Cleaned')
 
-    logger.info('Cleaning Kernel Source')
-    kernel.utils.clean(
-      kernel_src_dir=kernel_src,
-    )
-    logger.success('Kernel Source Cleaned')
-
-    logger.info('Applying Alpine Linux Kernel Build Info')
+  if cfg['kernel']['patch_src'] == 'alpine':
+    logger.info('Applying Alpine Linux Kernel Patch')
     kernel.alpine.apply_build_info(
-      build_info_src=build_info_src,
+      build_info_src=patch_src,
       kernel_src=kernel_src,
-      build_kind=kernel_build_kind,
+      build_kind=kernel_patch_kind,
       build_arch=target_arch,
+      build_out_dir=build_outputs,
     )
-    logger.success('Alpine Linux Kernel Build Info Applied')
+    logger.success('Alpine Linux Kernel Patch Applied')
+  else: raise NotImplementedError(f'Unsupported Kernel Patch Source: {cfg["kernel"]["patch_src"]}')
 
-    ### Build the Kernel
-    logger.info('Building the Kernel')
+  ### Build the Kernel
+  logger.info('Building the Kernel')
 
-    logger.info('Building vmlinux')
-    kernel.utils.build_vmlinux(
-      kernel_src_dir=kernel_src,
-      target_arch=target_arch,
-      build_version=kernel_build_semver,
-    )
-    logger.success('vmlinux Built')
-
-    # kernel.alpine.build(_extract_dir, workdir)
+  logger.info('Building vmlinux')
+  kernel.utils.build_vmlinux(
+    kernel_src_dir=kernel_src,
+    target_arch=target_arch,
+    build_version=kernel_build_semver,
+    build_out_dir=build_outputs,
+  )
+  logger.success('vmlinux Built')
   
-  raise NotImplementedError
+  logger.info('Building Kernel Image')
+  kernel.utils.build_image(
+    kernel_src_dir=kernel_src,
+    target_arch=target_arch,
+    build_version=kernel_build_semver,
+    build_out_dir=build_outputs,
+  )
+
+  logger.info('Building Kernel Modules')
+  kernel.utils.build_modules(
+    kernel_src_dir=kernel_src,
+    target_arch=target_arch,
+    build_version=kernel_build_semver,
+    build_out_dir=build_outputs,
+  )
+  logger.success('Kernel Modules Built')
+
+  logger.info('Packaging Kernel Artifacts')
+  kernel.utils.install_headers(
+    kernel_src_dir=kernel_src,
+    target_arch=target_arch,
+    build_version=kernel_build_semver,
+    build_out_dir=build_outputs,
+  )
+  kernel.utils.package(
+    kernel_src_dir=kernel_src,
+    target_arch=target_arch,
+    build_version=kernel_build_semver,
+    build_out_dir=build_outputs,
+  )
+  artifact.tar.create( # Kernel Image
+    src=build_outputs / 'tar-install/boot',
+    dst=workdir / f'linux-{kernel_build_semver}.tar.xz',
+    compress_algo='xz',
+  )
+  artifact.tar.create( # Kernel Headers
+    src=build_outputs / 'usr',
+    dst=workdir / f'linux-headers-{kernel_build_semver}.tar.xz',
+    compress_algo='xz',
+  )
+  artifact.tar.create( # Kernel Modules
+    src=build_outputs / 'tar-install/lib',
+    dst=workdir / f'linux-modules-{kernel_build_semver}.tar.xz',
+    compress_algo='xz',
+  )
+  logger.success('Kernel Artifacts Packaged')
+
+  return {'kernel': {
+    'version': kernel_build_semver,
+    'build_path': kernel_src.as_posix(),
+    'kernel_src': _kernel_archive.as_posix(),
+    'patch_path': patch_src.as_posix(),
+    'patch_src': _patch_archive.as_posix(),
+  }}
 
 def main() -> int:
   logger.debug('Checking for an AlpineLinux Environment')
@@ -264,11 +333,6 @@ def main() -> int:
   logger.debug('Checking we are root')
   if not os.getuid() == 0: raise BuildError('Must run as root')
   logger.success('Running as Root')
-
-
-  ### NOTE: Development
-  build_kernel()
-  ###
 
   build_cfg: schemas.BuildConfig = None
   build_cfg_json = sys.stdin.read().strip()
@@ -281,7 +345,14 @@ def main() -> int:
     'rootfs': None,
     'block_devices': [],
     'artifacts': [],
+    'kernel': None,
   }
+  ### NOTE: Development
+  (kernel_src := pathlib.Path(build_cfg['kernel']['path'])).mkdir(mode=0o755, parents=False, exist_ok=True)
+  (kernel_patch_src := pathlib.Path(build_cfg['kernel']['patch_path'])).mkdir(mode=0o755, parents=False, exist_ok=True)
+  build_result |= build_kernel(build_cfg)
+  raise NotImplementedError
+  ###
   (patched_cfg, status) = build_rootfs(build_cfg)
   build_cfg['rootfs'] |= patched_cfg
   build_result['rootfs'] = status

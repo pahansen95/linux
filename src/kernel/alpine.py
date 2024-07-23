@@ -37,12 +37,14 @@ def fetch_build_info(
 
   logger.debug(f"Fetching Alpine Linux Kernel Package Build Info: {src_url}")
   logger.info("Downloading the Alpine Linux Kernel Package Build Info")
+  proc_args = [
+    'curl', '-fL', '--progress-bar',
+      '--output', dl_archive.as_posix(),
+      src_url,
+  ]
+  logger.debug(f"Running: {' '.join(proc_args)}")
   proc: subprocess.CompletedProcess = subprocess.run(
-    [
-      'curl', '-fL', '--progress-bar',
-        '--output', dl_archive.as_posix(),
-        src_url,
-    ],
+    proc_args,
     stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr,
   )
   if proc.returncode != 0: raise RuntimeError(f"Failed to fetch the Alpine Linux Kernel Package Build Info: {dl_archive.as_posix()}")
@@ -54,14 +56,16 @@ def fetch_build_info(
   if not dl_archive.exists(): raise RuntimeError(f"Couldn't find the downloaded Alpine Linux Kernel Package Build Info: {dl_archive.as_posix()}")
 
   logger.info("Extracting the Alpine Linux Kernel Package Build Info")
+  proc_args = [
+    'tar', '-vx', '--gzip',
+      '-f', dl_archive.as_posix(),
+      '--strip-components', '3' if dest_dir else '2',
+      '-C', dest_dir.as_posix() if dest_dir else workdir.as_posix(),
+      f'aports-{ref}/main/linux-lts'
+  ]
+  logger.debug(f"Running: {' '.join(proc_args)}")
   proc: subprocess.CompletedProcess = subprocess.run(
-    [
-      'tar', '-vx', '--gzip',
-        '-f', dl_archive.as_posix(),
-        '--strip-components', '3' if dest_dir else '2',
-        '-C', dest_dir.as_posix() if dest_dir else workdir.as_posix(),
-        f'aports-{ref}/main/linux-lts'
-    ],
+    proc_args,
     stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr,
   )
   if proc.returncode != 0: raise RuntimeError(f"Failed to extract the Alpine Linux Kernel Package Build Info: {dl_archive.as_posix()}")
@@ -76,6 +80,7 @@ def apply_build_info(
   kernel_src: pathlib.Path,
   build_kind: Literal['lts', 'virt'],
   build_arch: Literal['x86', 'x86_64', 'armv7', 'aarch64', 'ppc64le', 's390x'],
+  build_out_dir: pathlib.Path = None,
 ) -> None:
   """Apply the Alpine Linux Build Info to the Linux Kernel Source"""
 
@@ -98,17 +103,20 @@ def apply_build_info(
   logger.info("Applying Patches to the Linux Kernel Source")
   for patch_file in build_info_src.glob('*.patch'):
     logger.debug(f"Applying Patch: {patch_file.name}")
+    proc_args = [
+      'patch', '-p', '1',
+        '-i', patch_file.as_posix(),
+        '-d', kernel_src.as_posix(),
+    ]
+    logger.debug(f"Running: {' '.join(proc_args)}")
     proc: subprocess.CompletedProcess = subprocess.run(
-      [
-        'patch', '-p', '1',
-          '-i', patch_file.as_posix(),
-          '-d', kernel_src.as_posix(),
-      ],
+      proc_args,
       stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr,
     )
     if proc.returncode != 0: raise RuntimeError(f"Failed to apply Patch: {patch_file.name}")
 
   ### Copy the Config File
   logger.info("Assembling the Linux Kernel Config")
-  shutil.copy2(cfg_src, kernel_src / '.config')
+  _dst_dir = build_out_dir if build_out_dir else kernel_src
+  shutil.copy2(cfg_src, _dst_dir / '.config')
   logger.trace(f"Kernel Config...\n{cfg_src.read_text()}")

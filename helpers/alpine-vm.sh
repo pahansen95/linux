@@ -77,6 +77,9 @@ _set_vm_opts() {
   else
     accel="tcg"
   fi
+  declare -ig cpus; cpus="$(nproc)"; cpus="$(( 75 * cpus / 100 ))"; cpus="$(( cpus % 2 ? cpus + 1 : cpus ))"
+  local -i total_mem_kb; total_mem_kb="$(grep -F 'MemTotal:' /proc/meminfo | awk '{print $2}')"
+  declare -ig mem_gb; mem_gb="$(( 75 * (total_mem_kb / ( 1024 * 1024 )) / 100 ))"
 }
 
 exec_installer_vm() {
@@ -87,8 +90,8 @@ exec_installer_vm() {
     -name "alpine-image-builder" \
     -machine "type=q35,accel=${accel}" \
     -bios "${uefi_firmware}" \
-    -smp "cpus=4" \
-    -m "size=$(( 16 * 1024 ))" \
+    -smp "cpus=${cpus}" \
+    -m "size=${mem_gb}G" \
     -display none \
     -serial mon:stdio \
     -netdev "user,id=net0,${_net_user_opts}" \
@@ -111,8 +114,8 @@ fork_builder_vm() {
       -name "alpine-image-builder" \
       -machine "type=q35,accel=${accel}" \
       -bios "${uefi_firmware}" \
-      -smp "cpus=4" \
-      -m "size=$(( 16 * 1024 ))" \
+      -smp "cpus=${cpus}" \
+      -m "size=${mem_gb}G" \
       -display none \
       -serial mon:stdio \
       -netdev "user,id=net0,${_net_user_opts}" \
@@ -170,7 +173,7 @@ case "${1:?Missing Subcommand}" in
 
     [[ -f "${cache_dir}/root.img" ]] || {
       log "Creating the Root Image"
-      qemu-img create -f qcow2 "${cache_dir}/root.img" 16G
+      qemu-img create -f qcow2 "${cache_dir}/root.img" 64G
     }
 
     [[ -f "${cache_dir}/id_ed25519" ]] || {
@@ -253,15 +256,17 @@ case "${1:?Missing Subcommand}" in
       install-deps )
         log "Installing Project Dependencies"
         _ssh "source /root/.venv/bin/activate && pip install -r /root/image-builder/src/requirements.txt"
+        _ssh "apk add fish"
         _ssh "apk add qemu qemu-system-${alpine_arch} qemu-tools qemu-img"
         _ssh "apk add losetup parted wipefs lvm2 btrfs-progs dosfstools e2fsprogs f2fs-tools xfsprogs ntfs-3g"
+        _ssh "apk add build-base curl perl gmp-dev mpc1-dev mpfr-dev elfutils-dev bash flex bison zstd sed installkernel bc linux-headers linux-firmware-any openssl-dev>3 mawk diffutils findutils zstd pahole python3 gcc>=13.1.1_git20230624"
         log "Project Dependencies have been installed"
         ;;
       build )
         log "Remotely building the Alpine Image"
         _ssh "install -dm0755 /mnt/build /mnt/build/rootfs"
         declare _arg_list; _arg_list="$(printf -- "%q " "${@:3}")"
-        _ssh "source /root/.venv/bin/activate && ( cd /root/image-builder/src && python3 build.py ${_arg_list})"
+        _ssh "source /root/.venv/bin/activate && ( cd /root/image-builder/src && LOG_LEVEL=${LOG_LEVEL:-INFO} python3 build.py ${_arg_list})"
         log "Remote build complete"
         ;;
       cleanup-build )

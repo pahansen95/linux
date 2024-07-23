@@ -79,6 +79,35 @@ class RootFSStatus(TypedDict):
   build_path: str
   """The Path containing the built RootFS"""
 
+class KernelCfg(TypedDict):
+  path: str
+  """The Path where the root of the kernel source will be extracted, built, etc..."""
+  version: str
+  """The Mainline Kernel Version to build"""
+  
+  ### TODO: Where should the following go?
+  patch_path: str
+  """The Path where the root of the Kernel Patch source will be extracted to"""
+  patch_src: Literal['alpine']
+  """Which Kernel Patch to apply to the Mainline Kernel"""
+  patch_ref: str
+  """The Git reference to the Alpine Linux Kernel aports project to fetch the Kernel Patches from; dependent on the patch source"""
+  patch_kind: Literal['lts', 'virt']
+  """The kind of Kernel Patches to apply; dependent on the patch source"""
+  ###
+  
+class KernelStatus(TypedDict):
+  version: str
+  """The Kernel Version built"""
+  build_path: str
+  """The Path containing the built Kernel"""
+  kernel_src: str
+  """The Kernel Source"""
+  patch_path: str
+  """The Path containing the Kernel Patch source"""
+  patch_src: str
+  """The Kernel Patch Source"""
+
 class BuildConfig(TypedDict):
   workdir: str
   """The Working Directory to persist runtime data"""
@@ -90,6 +119,7 @@ class BuildConfig(TypedDict):
   """The RootFS to build"""
   block_devices: list[BlkDevCfg]
   """The Block Devices to Configure"""
+  kernel: KernelCfg
 
 class BuildResult(TypedDict):
   rootfs: RootFSStatus
@@ -98,6 +128,8 @@ class BuildResult(TypedDict):
   """The Runtime State for each Block Device ordered by the configuration"""
   artifacts: list[ArtifactStatus]
   """The Artifacts produced by the build"""
+  kernel: KernelStatus
+  """The Runtime State for the Kernel"""
 
   @staticmethod
   def json_default(obj) -> object:

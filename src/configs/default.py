@@ -26,10 +26,20 @@ def assemble(
     'release': 'alpine',
     'version': '3.19',
   }
+  kernel_cfg: schemas.KernelCfg = {
+    'path': (_workdir / 'linux').as_posix(),
+    'version': '6.6.30',
+    # TODO: Move these elsewhere
+    'patch_path': (_workdir / 'linux-patches').as_posix(),
+    'patch_src': 'alpine',
+    'patch_ref': '3.19-stable',
+    'patch_kind': 'lts',
+  }
   return {
     'workdir': _workdir.as_posix(),
     'target_arch': target_arch,
     'rootfs': rootfs_cfg,
     'block_devices': blk_devs,
     'os': os_cfg,
+    'kernel': kernel_cfg,
   }
