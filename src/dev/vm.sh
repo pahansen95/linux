@@ -47,6 +47,7 @@ _network_init() {
     [host]= # The IP Address of the Host; if not provided it will be determined from the host
     [gateway]= # The IP Address of the Gateway upstream of the SDN Gateway; if not provided it will be determined from the host
     [table]=1 # The Routing Table to use; will create if it does not exist
+    [fwmark]=0x8765 # The Firewall Mark to use for SDN Traffic
     [domain]=vm # The Domain Name for the VM Network
   ); parse_kv o "$@"
   local -r netdir="${datadir}/net"
@@ -59,8 +60,9 @@ _network_init() {
   _ipam_kv() { kv "$1" "d=${ipamdir}/kv" "${@:2}"; }
   _ipam_kv get "k=.init" >/dev/null || { log 'IPAM must be initialized before the network can be setup'; return 1; }
 
-  # Record the Domain Name
+  # Record static vars
   _kv set "k=domain" "v=${o[domain]}"
+  _kv set "k=fwmark" "v=${o[fwmark]}"
 
   # Determine the Host IP Address
   [[ -n "${o[host]:-}" ]] || {
@@ -132,6 +134,8 @@ _network_init() {
 The Ruleset is relatively simple:
 
 - Mark SDN Traffic, all other rules are based on this mark as not to impact non-SDN Traffic
+  - Any traffic sourced from or destined to the SDN Network Range
+  - Any traffic whose ingress interface is the SDN Gateway Interface
 - Explicitly Allow
   - All Established/Related Traffic
   - All new traffic originating from the SDN's Network Range
@@ -142,40 +146,64 @@ The Ruleset is relatively simple:
 DOC
   _sudo nft -f - <<NFT
 table ip ${o[name]} {
-  # Mark the SDN Traffic
-  : # TODO
+  # Mark the SDN Traffic & Jump to the SDN Chains
+  chain mark_sdn {
+    type filter hook prerouting priority mangle
+    ip saddr ${_net} meta mark set ${o[fwmark]} return
+    ip daddr ${_net} meta mark set ${o[fwmark]} return
+    iifname "${o[name]}" meta mark set ${o[fwmark]} return
+  }
+  chain input {
+    type filter hook input priority filter
+    meta mark ${o[fwmark]} jump sdn_input
+  }
+  chain forward {
+    type filter hook forward priority filter
+    meta mark ${o[fwmark]} jump sdn_forward
+  }
+  chain output {
+    type filter hook output priority filter
+    meta mark ${o[fwmark]} jump sdn_output
+  }
+  chain prerouting {
+    type nat hook prerouting priority dstnat
+    meta mark ${o[fwmark]} jump sdn_prerouting
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat
+    meta mark ${o[fwmark]} jump sdn_postrouting
+  }
 
   # Packet Filtering
-  chain input {
-    type filter hook input priority filter; policy drop;
+  chain sdn_input {
     ct state { established, related } accept
     # Block all SDN Unicast Network Traffic, sourced from peers, Destined to the SDN Gateway IP
     ip saddr ${_net} ip daddr ${_gtwy_ip} ip saddr != ${_gtwy_ip} pkttype != { broadcast, multicast } drop
     # Allow all other SDN Traffic
     ip saddr ${_net} ct state new accept
+    drop
   }
-  chain forward {
-    type filter hook forward priority filter; policy drop;
+  chain sdn_forward {
     ct state { established, related } accept
     ip saddr ${_net} ct state new accept
+    drop
   }
-  chain output {
-    type filter hook output priority filter
+  chain sdn_output {
     accept # TODO: For now just allow all outbound
   }
 
   # NAT & VIP Mapping
-  chain prerouting {
-    type nat hook prerouting priority dstnat; policy accept;
+  chain sdn_prerouting {
     # Map the Network Services VIP to the Gateway's IP Address
     ip daddr ${_netsvc_vip} dnat to ${_gtwy_ip}
     # Map the Host VIP to the Host's IP Address
     ip daddr ${_host_vip} dnat to ${o[host]}
+    accept
   }
-  chain postrouting {
-    type nat hook postrouting priority srcnat; policy accept;
+  chain sdn_postrouting {
     # Masquerade all outbound traffic
     ip saddr ${_net} oifname "${o[name]}" masquerade
+    accept
   }
 }
 NFT
