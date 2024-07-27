@@ -19,14 +19,399 @@ source "${CI_PROJECT_DIR}/src/_common.sh"
 ### Functions ###
 
 _cloudinit_gen() {
-  local -A _opts=()
-  parse_kv _opts "$@"
-
-  : # TODO
+  local -A o=(); parse_kv o "$@"
 
 }
 
-_load_runtime() {
+: <<'DOC'
+# Network Design
+
+We create a fully contained Software Defined Network for all the VMs to use.
+
+A Tap Device is created to serve as the gateway for the VMs to communicate northbound.
+MACVLAN Interfaces are created off the gateway interface per VM & set into bridge mode to allow
+cross-VM communication.
+
+All Network Services, such as NTP, DHCP, DNS, and IPAM are provided by the Gateway VM
+spread accross multiple IP Addresses. Besides IPAM, all network services are stateless; that is on teardown
+all state is lost.
+
+All SDN Traffic uses a dedicated Routing Table to ensure that only SDN Traffic is routed through the Gateway.
+
+DOC
+_network_init() {
+  log 'Initializing the Network'
+  local -A o=(
+    [name]=qemu0 # The name of the SDN Gateway Interface
+    [inf]= # The Name of the Parent Interface; if not provided will use the Interface of the default Gateway
+    [host]= # The IP Address of the Host; if not provided it will be determined from the host
+    [gateway]= # The IP Address of the Gateway upstream of the SDN Gateway; if not provided it will be determined from the host
+    [table]=1 # The Routing Table to use; will create if it does not exist
+    [domain]=vm # The Domain Name for the VM Network
+  ); parse_kv o "$@"
+  local -r netdir="${datadir}/net"
+  [[ -d "${netdir}" ]] || install -dm0750 "${netdir}"
+  kv init "d=${netdir}/kv"
+  _kv() { kv "$1" "d=${netdir}/kv" "${@:2}"; }
+  ! _kv get "k=.init" >/dev/null || { log 'Network already initialized'; return 0; }
+
+  local ipamdir="${datadir}/ipam"
+  _ipam_kv() { kv "$1" "d=${ipamdir}/kv" "${@:2}"; }
+  _ipam_kv get "k=.init" >/dev/null || { log 'IPAM must be initialized before the network can be setup'; return 1; }
+
+  # Record the Domain Name
+  _kv set "k=domain" "v=${o[domain]}"
+
+  # Determine the Host IP Address
+  [[ -n "${o[host]:-}" ]] || {
+    log 'Determining the Host IP Address'
+    o[host]="$(
+      ip -j route show default |
+        jq -r '.[0].dev' |
+        xargs -I {} ip -j addr show {} |
+        jq -r '.[0].addr_info | map(select(.family == "inet"))[0].local'
+    )" || {
+      log 'Failed to determine the Host IP Address'
+      return 1
+    }
+  }
+  _kv set "k=hostIP" "v=${o[host]}"
+  local _host_inf; _host_inf="$(
+    # Find the Network Interface that has the Host IP Address
+    ip -j addr show |
+      jq -r --arg host "${o[host]}" \
+        '.[] | select(.addr_info | map(select(.local == $host)) | length > 0) | .ifname'
+  )"
+  _kv set "k=hostInf" "v=${_host_inf}"
+
+  # Determine the Gateway IP Address
+  [[ -n "${o[gateway]:-}" ]] || {
+    log 'Determining the Gateway IP Address'
+    o[gateway]="$(
+      ip -j route show default |
+        jq -r '.[0].gateway'
+    )" || {
+      log 'Failed to determine the Gateway IP Address'
+      return 1
+    }
+  }
+  _kv set "k=gatewayIP" "v=${o[gateway]}"
+  local _gtwy_inf; _gtwy_inf="$(
+    # Find the Network Interface that routes the Gateway IP Address
+    ip -j route get "${o[gateway]}" |
+      jq -r '.[0].dev'
+  )"
+  _kv set "k=gatewayInf" "v=${_gtwy_inf}"
+
+  # TODO: Do I need to make this idempotent
+  log 'Creating the Gateway Interface'
+  # NOTE: We can just create nested macvlan interfaces; but this requires that parent interface has an ethernet address
+  #       We can't use something like a WireGuard Interface as the parent interface; later, we can probably check for
+  #       MAC Support & otherwise create a dummy interface
+  if [[ -z "${o[inf]:-}" ]]; then { local _parent_inf="${_gtwy_inf}"; }; else { local _parent_inf="${o[inf]}"; }; fi
+  { ip -j link show "${_parent_inf}" | jq -e '.[0].link_type == "ether"' >/dev/null ; } || {
+    log 'NotImplemented: Parent Interface does not have an Ethernet Address'
+    return 1
+  }
+  _kv set "k=parentInf" "v=${_parent_inf}"
+  _sudo ip link add link "${_parent_inf}" name "${o[name]}" type macvlan mode bridge
+  _kv set "k=inf" "v=${o[name]}"
+
+  log 'Assigning the Gateway Interface IP Address'
+  local _net; _net="$(_ipam_kv get "k=net")"
+  local _prefix; _prefix="${_net##*/}"
+  local _gtwy_ip; _gtwy_ip="$(_ipam_kv get "k=gatewayIP")"
+  # _sudo ip addr add "${_gtwy_ip}/${_prefix}" dev "${o[name]}" # TODO Uncomment when ready
+
+  local _host_vip; _host_vip="$(_ipam_kv get "k=hostIP")"
+  local _netsvc_vip; _netsvc_vip="$(_ipam_kv get "k=netsvcIP")"
+  local _net_bcst; _net_bcst="$(_ipam_kv get "k=broadcast")"
+
+  log 'Adding Packet Filtering Rules'
+  : <<'DOC'
+The Ruleset is relatively simple:
+
+- Mark SDN Traffic, all other rules are based on this mark as not to impact non-SDN Traffic
+- Explicitly Allow
+  - All Established/Related Traffic
+  - All new traffic originating from the SDN's Network Range
+    - But don't allow SDN traffic destined to the Gateway IP Address; Peers must use the Network Service VIPs
+- Setup DNAT rules for the Network Services:
+  - Map Network Services VIP to the Gateway's IP Address
+  - Map the Host VIP to the Host's IP Address
+DOC
+  _sudo nft -f - <<NFT
+table ip ${o[name]} {
+  # Mark the SDN Traffic
+  : # TODO
+
+  # Packet Filtering
+  chain input {
+    type filter hook input priority filter; policy drop;
+    ct state { established, related } accept
+    # Block all SDN Unicast Network Traffic, sourced from peers, Destined to the SDN Gateway IP
+    ip saddr ${_net} ip daddr ${_gtwy_ip} ip saddr != ${_gtwy_ip} pkttype != { broadcast, multicast } drop
+    # Allow all other SDN Traffic
+    ip saddr ${_net} ct state new accept
+  }
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    ct state { established, related } accept
+    ip saddr ${_net} ct state new accept
+  }
+  chain output {
+    type filter hook output priority filter
+    accept # TODO: For now just allow all outbound
+  }
+
+  # NAT & VIP Mapping
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    # Map the Network Services VIP to the Gateway's IP Address
+    ip daddr ${_netsvc_vip} dnat to ${_gtwy_ip}
+    # Map the Host VIP to the Host's IP Address
+    ip daddr ${_host_vip} dnat to ${o[host]}
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    # Masquerade all outbound traffic
+    ip saddr ${_net} oifname "${o[name]}" masquerade
+  }
+}
+NFT
+  _kv set "k=nftable" "v=${o[name]}"
+
+  # We have to bring the interface up before we can add routes
+  log 'Bringing Up the Gateway Interface'
+  _sudo ip link set dev "${o[name]}" up
+
+  log 'Adding Conditional Routing'
+  _kv set "k=table" "v=${o[table]}"
+  # Create a new Routing table for the SDN
+  _add_route() { _sudo ip route add "$@" table "${o[table]}"; }
+  _add_route "${_net}" dev "${o[name]}" # Route all SDN Traffic to the Gateway Interface
+  _add_route default via "${o[gateway]}" # Route all non-SDN Traffic to the Gateway
+  # Add a rule for all SDN traffic to use the SDN Routing Table
+  _add_rule() { _sudo ip rule add "$@" lookup "${o[table]}"; }
+  _add_rule to "${_net}" # All Traffic to the SDN Network
+  _add_rule from "${_net}" # All Traffic from the SDN Network
+
+  log 'Enabling IP Forwarding'
+  for syskey in \
+    "net.ipv4.conf.${o[name]}.forwarding" \
+    "net.ipv4.conf.${_host_inf}.forwarding" \
+    "net.ipv4.conf.${_gtwy_inf}.forwarding" \
+  ; do
+    _kv set "k=${syskey}" "v=$(sysctl -n "${syskey}")"
+    _sudo sysctl -qw "${syskey}=1"
+  done
+
+  log 'Network Initialized'
+  _kv set "k=.init"
+}
+_network_revert() {
+  log 'Reverting the Network State'
+  local -r netdir="${datadir}/net"
+  [[ -d "${netdir}" ]] || { log "Network not initialized"; return 0; }
+  _kv() { kv "$1" "d=${netdir}/kv" "${@:2}"; }
+  # _kv get "k=.init" || { log 'Network not initialized'; return 0; }
+  local ipamdir="${datadir}/ipam"
+  _ipam_kv() { kv "$1" "d=${ipamdir}/kv" "${@:2}"; }
+
+  log 'Bringing down the Gateway Interface'
+  local _inf; _inf="$(_kv get "k=inf")"
+  _sudo ip link set dev "${_inf}" down
+
+  log 'Disabling IP Forwarding'
+  for syskey in \
+    "net.ipv4.conf.${_inf}.forwarding" \
+    "net.ipv4.conf.$(_kv get "k=hostInf").forwarding" \
+    "net.ipv4.conf.$(_kv get "k=gatewayInf").forwarding" \
+  ; do
+    _sudo sysctl -qw "${syskey}=$(_kv get "k=${syskey}")"
+  done
+
+  log 'Removing Conditional Routing'
+  local _net; _net="$(_ipam_kv get "k=net")"
+  local _table; _table="$(_kv get "k=table")"
+  _rm_rule() { _sudo ip rule del "$@" lookup "${_table}"; }
+  _rm_rule to "${_net}"
+  _rm_rule from "${_net}"
+  _sudo ip route flush table "${_table}"
+
+  log 'Flushing Netfilter Table'
+  local _nftable; _nftable="$(_kv get "k=nftable")"
+  _sudo nft "delete table ip ${_nftable}"
+
+  log 'Removing the SDN Gateway Interface'
+  _sudo ip link del dev "${_inf}"
+
+  log 'Flushing the KV Store'
+  _kv flush
+}
+_dnsmasq_gencfg() {
+  log 'Generating dnsmasq Configs'
+  local \
+    netdir="${datadir}/net" \
+    ipamdir="${datadir}/ipam"
+    masqdir="${datadir}/net/dnsmasq"
+  install -dm0750 "${masqdir}"{,/kv,/conf.d}
+  _kv() { kv "$1" "d=${masqdir}/kv" "${@:2}"; }
+  _netkv() { kv "$1" "d=${netdir}/kv" "${@:2}"; }
+  _ipamkv() { kv "$1" "d=${ipamdir}/kv" "${@:2}"; }
+
+  local _netmask; _netmask="$(_ipamkv get "k=net")"; _netmask="${_netmask##*/}"; _netmask="$(
+    inet4 cidr2mask "${_netmask}"
+  )"
+
+  install -m0640 <(cat  <<DNSMASQ
+### The Server's Main Configuration ###
+
+# Socket Opts
+listen-address=$(_netkv get "k=gatewayIP") # Listen ONLY on the SDN Gateway IP
+
+# DNS
+resolv-file=/etc/resolv.conf # Use the Host's DNS Servers
+clear-on-reload # Flush the DNS cache when resolv.conf changes
+strict-order # Search upstream DNS Servers in the order they are listed in resolv.conf
+no-hosts # Don't serve DNS Records from /etc/hosts
+domain=$(_netkv get "k=domain")
+local=/$(_netkv get "k=domain")/
+stop-dns-rebind # Prevent DNS Rebinding Attacks
+rebind-localhost-ok # Allow DNS Rebinding to localhost
+
+# DHCP
+dhcp-generate-names # Generate DHCP Names if the client doesn't provide one
+dhcp-range=$(_ipamkv get "k=dhcp"),1h # The DHCP Range
+dhcp-option=option:netmask,${_netmask} # The Network Mask
+dhcp-option=option:router,$(_ipamkv get "k=gatewayIP") # The Gateway IP
+dhcp-option=28,$(_ipamkv get "k=broadcast") # The Broadcast Address
+dhcp-option=54,$(_ipamkv get "k=netsvcIP") # The DHCP Server IP clients will use
+dhcp-option=51,600 # The Lease Time in seconds
+dhcp-option=option:dns-server,$(_ipamkv get "k=netsvcIP") # The DNS Server IP clients will use
+dhcp-option=option:ntp-server,$(_ipamkv get "k=netsvcIP") # The NTP Server IP clients will use
+dhcp-option=option:domain-name,$(_netkv get "k=domain") # The Domain Name
+dhcp-option=option:domain-search,$(_netkv get "k=domain") # The Domain Search List
+
+# Meta Options
+log-facility=- # Log to stderr
+log-queries # Log DNS Queries
+log-dhcp # Log DHCP Requests
+cache-size=1000 # Cache Size
+
+# Finally include the conf.d directory
+conf-dir=${masqdir}/conf.d/,*.conf
+
+DNSMASQ
+  ) "${masqdir}/main.conf"
+
+}
+_dnsmasq_up() {
+  log 'Bringing Up the dnsmasq Server'
+  local -A o=(
+    [bin]= # The Path to the dnsmasq binary
+  ); parse_kv o "$@"
+  kv get "d=${datadir}/net/kv" "k=.init" >/dev/null || { log 'Network not initialized'; return 1; }
+  local masqdir="${datadir}/net/dnsmasq"
+  install -dm0750 "${masqdir}"{,/kv}
+  install -m0640 /dev/null "${masqdir}/leases"
+  _kv() { kv "$1" "d=${masqdir}/kv" "${@:2}"; }
+
+  _dnsmasq_gencfg || { log 'Failed to Generate dnsmasq Configs'; return 1; }
+
+  local dnsmasq="${o[bin]:-}"; [[ -n "${dnsmasq:-}" ]] || dnsmasq="$(command -v dnsmasq)"
+  [[ -x "${dnsmasq}" ]] || { log 'dnsmasq not found'; return 1; }
+  _kv set "k=bin" "v=${dnsmasq}"
+
+  log 'Validating dnsmasq Configs'
+  "${dnsmasq}" --test --conf-file="${masqdir}/main.conf" || {
+    log 'Failed to Validate dnsmasq Configs'
+    return 1
+  }
+
+  log 'Running dnsmasq'
+  local -a _argv=(
+    --keep-in-foreground
+    --dhcp-leasefile="${masqdir}/leases"
+    # TODO: --dhcp-script="${masqdir}/dhcp-lease.sh"
+    --conf-file="${masqdir}/main.conf"
+  )
+  _sudo "${dnsmasq}" "${_argv[@]}" &>"${masqdir}/dnsmasq.log" &
+  local _pid="$!"
+  kill -0 "${_pid}" || {
+    log 'Failed to Start dnsmasq'
+    return 1
+  }
+  _kv set "k=pid" "v=$!"
+}
+_dnsmasq_down() {
+  log 'Bringing Down the dnsmasq Server'
+  local masqdir="${datadir}/net/dnsmasq"
+  install -dm0750 "${masqdir}"{,/kv}
+  _kv() { kv "$1" "d=${masqdir}/kv" "${@:2}"; }
+
+  local _pid; _pid="$(_kv get "k=pid")" || {
+    log 'dnsmasq not running'
+    return 0
+  }
+  proc status "pid=${_pid}" || {
+    log 'dnsmasq not running'
+    return 0
+  }
+  log 'Killing dnsmasq'
+  proc stop "pid=${_pid}" || {
+    log 'Failed to Stop dnsmasq'
+    return 1
+  }
+}
+_chrony_up() {
+  log 'Bringing Up the Chrony Server'
+  : # TODO
+}
+_chrony_down() {
+  log 'Bringing Down the Chrony Server'
+  : # TODO
+}
+
+_ipam_init() {
+  log 'Initializing IPAM'
+  local -A o=(
+    [net]="169.254.0.0/24" # The Network Range
+    [svc]="169.254.0.1,169.254.0.9" # The Service Range (Reserved for Network Services)
+    [static]="169.254.0.10,169.254.0.99" # The Static IP Range
+    [dhcp]="169.254.0.100,169.254.0.254" # The DHCP Range
+    [broadcast]="169.254.0.255" # The Broadcast Address (Must be the top most ip address of the network)
+    [gatewayIP]="169.254.0.1" # The Network's Gateway Address
+    [netsvcIP]="169.254.0.2" # The VIP for the Network Services
+    [hostIP]="169.254.0.3" # The VIP for the Host
+  ); parse_kv o "$@"
+  [[ -d "${datadir}/ipam" ]] || install -dm0750 "${datadir}/ipam"
+  [[ -d "${datadir}/ipam/kv" ]] || install -dm0750 "${datadir}/ipam/kv"
+  _kv() { kv "$1" "d=${datadir}/ipam/kv" "${@:2}"; }
+  ! _kv get "k=.init" || { log 'IPAM already initialized'; return 0; }
+  install -dm0750 "${datadir}/ipam/leases"
+
+  # Write the KV Pairs to disk
+  for k in \
+    net svc static dhcp broadcast gatewayIP netsvcIP hostIP \
+  ; do
+    _kv set "k=${k}" "v=${o[$k]}"
+  done
+
+  _kv set "k=.init"
+}
+
+_ipam_lease_addr() {
+  log 'Leasing a static IP Address'
+  : # TODO
+}
+
+_ipam_release_addr() {
+  log 'Releasing a static IP Address'
+  : # TODO
+}
+
+_runtime_load() {
   local -n _opts_fn_nr="${1:?Missing Assoc Array Name}"
   
   # Find the QEMU System Binary
@@ -49,26 +434,83 @@ _load_runtime() {
     local _accel='tcg'
   fi
 
-  # Find the BIOS & EFI Firmware
+  # Find the EFI Firmware
+  local _efi_firmware
+  for _search_path in \
+    "${datadir}" \
+    "/home/linuxbrew/.linuxbrew/share/qemu" \
+    "/usr/share/OVMF" \
+  ; do
+    mapfile -t _fws < <( find "${_search_path}/" -type f -iname '*.fd' -print )
+    [[ "${#_fws[@]}" -gt 0 ]] || continue
+    mapfile -t <( str filter "/(edk2-${_arch}-code|OVMF_CODE|OVMF)\." "${_fws[@]}" )
+    log "Found EFI Firmware: $(str join ', ' "${MAPFILE[@]}")"
+    [[ "${#MAPFILE[@]}" -gt 0 ]] || continue
+    _efi_firmware="${MAPFILE[0]}"
+    break
+  done
+  [[ -n "${_efi_firmware}" ]] || {
+    log 'Failed to find EFI Firmware; if you have skipped building OVMF during initialization than please install your distributions OVMF package; on Debian/Ubuntu it is `ovmf`'
+    return 1
+  }
+  log "Using EFI Firmware: ${_efi_firmware}"
 
+  # Find the BIOS Firmware
+  local _bios_firmware
+  for _path in \
+    "${datadir}" \
+    "/home/linuxbrew/.linuxbrew/share/qemu" \
+    "/usr/share/seabios" \
+  ; do
+    mapfile -t _fws < <( find "${_search_path}/" -type f -iname '*.bin' -print )
+    [[ "${#_fws[@]}" -gt 0 ]] || continue
+    mapfile -t <( str filter '/(bios)\.' "${_fws[@]}" )
+    log "Found BIOS Firmware: $(str join ', ' "${MAPFILE[@]}")"
+    [[ "${#MAPFILE[@]}" -gt 0 ]] || continue
+    _bios_firmware="${MAPFILE[0]}"
+    break
+  done
+  [[ -n "${_bios_firmware}" ]] || {
+    log 'Failed to find BIOS Firmware; if you have skipped building SeaBIOS during initialization than please install your distributions SeaBIOS package; on Debian/Ubuntu it is `seabios`'
+    return 1
+  }
+  log "Using BIOS Firmware: ${_bios_firmware}"
+
+  # Load the Network Options
+  local _net_opts; mapfile -t < <(
+    for k in \
+      net dhcp static host dns ipv4 ipv6 restrict \
+    ; do
+      printf '%s=%s\n' "$k" "${datadir}/ipam/opts/$k"
+    done
+  ); _net_opts="$(str join ',' "${MAPFILE[@]}")"
+
+  # Assemble the System Options
+  _opts_fn_nr[arch]="${_arch}"
+  _opts_fn_nr[cpus]="${_cpus}"
+  _opts_fn_nr[mem]="${_mem}"
+  _opts_fn_nr[accel]="${_accel}"
+  _opts_fn_nr[efiFirmware]="${_efi_firmware}"
+  _opts_fn_nr[biosFirmware]="${_bios_firmware}"
+  _opts_fn_nr[netOpts]="${_net_opts}"
 }
 
-_spawn_vm() {
+_vm_spawn() {
   log 'Spawning VM'
   local -A _user_opts=(
     [name]='dev-vm'
     [machine]=q35 # q35 | pc | microvm
-    [rootDisk]="${datadir}/alpine-root.img"
-    [cdrom]="${datadir}/ci.iso"
+    [rootDisk]= # The Root Disk Image
+    [cdrom]= # The CDROM Image
     # Runtime Overrides
     [arch]= # Defaults to Host Arch
     [cpus]= # Defaults to Host CPU Count
     [mem]= # Defaults to 90% of Host Memory
     [accel]= # Defaults to KVM
-    [efiFirmware]=
-    [biosFirmware]=
-  )
-  parse_kv _user_opts "$@"
+    [efiFirmware]= # The EFI Firmware to use
+    [biosFirmware]= # The BIOS Firmware to use 
+  ); parse_kv _user_opts "$@"
+  local -r vmdir="${datadir}/${o[name]}"
 
   # These are determined at runtime
   local -A _sys_opts=(
@@ -80,13 +522,9 @@ _spawn_vm() {
     [biosFirmware]=
     [netOpts]=
   )
-  _load_runtime _sys_opts
+  _runtime_load _sys_opts
   
-  local -A o=()
-  merge_kv o _sys_opts _user_opts
-
-  local -r _dir="${datadir}/${o[name]}"
-  install -dm0750 "${_dir}"
+  local -A o=(); merge_kv o _sys_opts _user_opts
 
   if [[ "${o[machine]}" == q35 ]]; then
     local -a _machine_flags=(
@@ -108,13 +546,13 @@ _spawn_vm() {
 
   local -a _monitor=( # The QEMU Monitor for the VM
     # A Unix socket; Configured for QMP JSON Commands
-    -chardev "socket,id=monitor0,path=${_dir}/monitor.sock,server,nowait,logfile=${_dir}/monitor.log"
+    -chardev "socket,id=monitor0,path=${vmdir}/monitor.sock,server,nowait,logfile=${vmdir}/monitor.log"
     -mon "chardev=monitor0,mode=control"
   )
   local -a _serial=( # The VM Serial Console
     -nographic # Completely Disable Graphics; Serial Only
     # Unix Socket w/ extra opts: a logfile, no signals
-    -chardev "socket,id=serial0,path=${_dir}/serial.sock,server,nowait,logfile=${_dir}/serial.log,signal=off"
+    -chardev "socket,id=serial0,path=${vmdir}/serial.sock,server,nowait,logfile=${vmdir}/serial.log,signal=off"
     -serial "chardev:serial0"
   )
   local -a _netdevs=( # Network Devices
@@ -137,7 +575,7 @@ _spawn_vm() {
     -object 'rng-random,id=rng0,filename=/dev/urandom'
     -device 'virtio-rng-device,rng=rng0'
     # TPM ; TODO: Check for Host TPM & Passthrough
-    -chardev "socket,id=chrtpm0,path=${_dir}/tpm0.sock"
+    -chardev "socket,id=chrtpm0,path=${vmdir}/tpm0.sock"
     -tpmdev 'emulator,id=tpm0,chardev=chrtpm0'
     -device 'tpm-tis,tpmdev=chrtpm0'
   )
@@ -153,23 +591,21 @@ _spawn_vm() {
     "${_miscdevs[@]}"
   )
   log "Running VM: ${_qemu_system}...\n$(printf '\t%s\n' "${_qemu_argv[@]}")"
-  sudo "${_qemu_system}" "${_qemu_argv[@]}" &>"${_dir}/qemu.log" &
-  printf %s "$!" > "${_dir}/qemu.pid"
-  kill -0 "$(< "${_dir}/qemu.pid")" || {
+  sudo "${_qemu_system}" "${_qemu_argv[@]}" &>"${vmdir}/qemu.log" &
+  printf %s "$!" > "${vmdir}/qemu.pid"
+  kill -0 "$(< "${vmdir}/qemu.pid")" || {
     log 'Failed to Start VM'
     return 1
   }
-  disown "$(< "${_dir}/qemu.pid")"
+  disown "$(< "${vmdir}/qemu.pid")"
 }
 
-_kill_vm() {
+_vm_kill() {
   : # TODO Kill the VM Process
 }
 
-_init_vm() {
-  local -A _opts=()
-  parse_kv _opts "$@"
-
+_vm_wait_for() {
+  : # TODO Wait for a condition to be met
 }
 
 ### SubCommands ###
@@ -180,6 +616,12 @@ qemu_init() {
   if check_root &>/dev/null; then { log 'Do not run as root'; return 1; }; fi
 
   command -v "qemu-system-$(uname -m)" &> /dev/null || { log 'QEMU not found'; return 1; }
+
+  get_event 'ipam-init' || {
+    log 'Initializing IPAM'
+    _ipam_init
+    set_event 'ipam-init'
+  }
 
   get_event 'fetch-alpine' || {
     log 'Fetching the Alpine Base Image'
@@ -302,6 +744,18 @@ EDKBUILD
     set_event 'build-edk2'
   }
 
+  get_event 'ipam-init' || {
+    # log 'Initializing IPAM'
+    _ipam_init
+    set_event 'ipam-init'
+  }
+
+  get_event 'net-init' || {
+    # log 'Initializing the Network'
+    _network_init
+    set_event 'net-init'
+  }
+
   log 'QEMU Environment Initialized'
   set_event 'qemu-init'
 }
@@ -340,12 +794,20 @@ vm_init() {
     set_event 'generate-ci'
   }
 
-  get_event 'initialize-vm' || {
-    log 'Initializing the VM'
-    _init_vm \
+  get_event 'first-boot' || {
+    log 'Spawning the VM'
+    _vm_spawn "name=${_opts[name]}" \
       "root=${vmdir}/root.img" \
       "ci=${vmdir}/ci.img"
-    set_event 'initialize-vm'
+    
+    log 'Waiting for VM Bootstrapping to Finalize'
+    _vm_wait_for "name=${_opts[name]}" \
+      "event=..."
+
+    log 'Killing the VM'
+    _vm_kill "name=${_opts[name]}"
+
+    set_event 'first-boot'
   }
 
 }
@@ -380,9 +842,10 @@ purge() {
 
 declare -r subcmd="${1:-build}"; [[ -z "${1:-}" ]] || shift
 case "${subcmd}" in
-  init ) qemu_init ;;
+  init ) can_sudo && qemu_init ;;
   purge ) can_sudo && purge;;
   vm-init ) can_sudo && vm_init;;
   vm-purge ) can_sudo && vm_purge;;
+  _dev ) can_sudo && "$@";;
   * ) log "Unknown subcommand: ${subcmd}"; exit 1 ;;
 esac

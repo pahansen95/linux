@@ -48,10 +48,161 @@ _str_split() {
   [[ "$#" -le 1 ]] || { log "Expected exactly 2 args"; return 1; }
   printf %s "${1}" | awk -v sep="${_sep}" '{n=split($0, a, sep); for (i=1; i<=n; i++) print a[i]}'
 }
+_str_filter() {
+  local _re="${1:?Missing Regular Expression}"; shift 1
+  [[ "$#" -le 1 ]] || { log "Expected exactly 2 args"; return 1; }
+  printf '%s\n' "$@" | awk -v re="${_re}" '$0 ~ re'
+}
 str() {
   local _subcmd="${1:?Missing Subcommand}"; shift 1
   case "${_subcmd}" in
-    join|split ) "_str_${_subcmd}" "$@" ;;
+    join|split|filter ) "_str_${_subcmd}" "$@" ;;
+    * )
+      log "Unknown Subcommand: ${_subcmd}"
+      return 1
+      ;;
+  esac
+}
+
+### (Stupid Simple) Key-Value Store ###
+
+_kv_init() {
+  local -A o=(
+    [d]= # The Directory to Store the KV
+  ); parse_kv o "$@"
+  [[ -d "${o[d]}" ]] || install -dm0755 "${o[d]}"
+}
+_kv_set() {
+  local -A o=(
+    [d]= # The Directory to Store the KV
+    [k]= # The Key
+    [v]=true # The Value
+  ); parse_kv o "$@"
+  printf '%s\n' "${o[v]}" > "${o[d]}/${o[k]}"
+}
+_kv_get() {
+  local -A o=(
+    [d]= # The Directory to Store the KV
+    [k]= # The Key
+  ); parse_kv o "$@"
+  [[ -f "${o[d]}/${o[k]}" ]] || return 1
+  cat "${o[d]}/${o[k]}"
+}
+_kv_clear() {
+  local -A o=(
+    [d]= # The Directory to Store the KV
+    [k]= # The Key
+  ); parse_kv o "$@"
+  [[ ! -f "${o[d]}/${o[k]}" ]] || unlink "${o[d]}/${o[k]}"
+}
+_kv_flush() {
+  local -A o=(
+    [d]= # The Directory to Store the KV
+  ); parse_kv o "$@"
+  local _emptydir; _emptydir="$(mktemp -d)"; trap "rmdir '${_emptydir}' &>/dev/null || true" RETURN
+  rsync -a --delete "${_emptydir}/" "${o[d]}/"  &>/dev/null || {
+    log "Failed to drop the KV Store"
+    return 1
+  }
+}
+kv() {
+  local _subcmd="${1:?Missing Subcommand}"; shift 1
+  case "${_subcmd}" in
+    init|set|get|clear|flush ) "_kv_${_subcmd}" "$@" ;;
+    * )
+      log "Unknown Subcommand: ${_subcmd}"
+      return 1
+      ;;
+  esac
+}
+
+### IP Address Tools ###
+
+# Convert between integer & string notation
+_inet4_int_to_octet() {
+  printf '%d.%d.%d.%d\n' \
+    $(( (${1:?Missing Integer} >> 24) & 255 )) \
+    $(( ($1 >> 16) & 255 )) \
+    $(( ($1 >> 8) & 255 )) \
+    $(( $1 & 255 ))
+}
+_inet4_octet_to_int() {
+  local -i _int=0
+  IFS='.' read -ra _octets <<< "${1:?Missing Octet String}"
+  # For each octet, convert to an 8 bit integer & shift it to the correct position w/in the 32 bit integer
+  for i in {0..3}; do
+    (( _int = (_int << 8) + _octets[i] ))
+  done
+  printf '%d\n' "${_int}"
+}
+# Convert between CIDR & Mask Notation
+_inet4_cidr_to_mask() {
+  local -i _cidr="${1:?Missing CIDR}"
+  local -i _mask=0
+  # Left shift a full mask by the number of bits to not mask
+  (( _mask = 0xffffffff << (32 - _cidr) ))
+  _inet4_int_to_octet "${_mask}"
+}
+_inet4_mask_to_cidr() {
+  local -i _mask; _mask="$(_inet4_octet_to_int "${1:?Missing Mask}")"
+  local -i _cidr=0
+  # Left shift the mask, counting how many times the Most Significant Bit is 1; stop when the MSB is 0
+  while (( _mask & 0x80000000 )); do
+    (( _cidr += 1 ))
+    (( _mask <<= 1 ))
+  done
+  printf '%d\n' "${_cidr}"
+}
+inet4() {
+  local _subcmd="${1:?Missing Subcommand}"; shift 1
+  case "${_subcmd}" in
+    int2str ) _inet4_int_to_octet "$@" ;;
+    str2int ) _inet4_octet_to_int "$@" ;;
+    cidr2mask ) _inet4_cidr_to_mask "$@" ;;
+    mask2cidr ) _inet4_mask_to_cidr "$@" ;;
+    * )
+      log "Unknown Subcommand: ${_subcmd}"
+      return 1
+      ;;
+  esac
+}
+
+### Process & Concurrency Tools ###
+
+_proc_status() {
+  local -A o=(
+    [pid]= # The PID to Check
+  ); parse_kv o "$@"
+  kill -0 "${o[pid]}" &>/dev/null
+}
+_proc_stop() {
+  local -A o=(
+    [pid]= # The PID to Send the Signal to
+    [sig]=TERM # The Signal to Send
+    [timeout]=10 # The Timeout to Wait for the Process to Stop
+    [kill]=true # Whether to Send a Kill Signal on Timeout
+  ); parse_kv o "$@"
+
+  log "Stopping Process ${o[pid]}"
+  kill -s "${o[sig]}" "${o[pid]}" &>/dev/null || {
+    log "Failed to stop Process ${o[pid]}"
+    return 1
+  }
+  log "Waiting for Process ${o[pid]} to stop"
+  timeout -s TERM "${o[timeout]}" tail --pid="${o[pid]}" -f /dev/null || {
+    log "Timed out waiting for Process ${o[pid]} to stop"
+    [[ "${o[kill]}" ]] || return 1
+    log "Killing Process ${o[pid]}"
+    kill -s KILL "${o[pid]}" &>/dev/null || {
+      log "Failed to kill Process ${o[pid]}"
+      return 1
+    }
+  }
+}
+proc() {
+  local _subcmd="${1:?Missing Subcommand}"; shift 1
+  case "${_subcmd}" in
+    stop|status ) "_proc_${_subcmd}" "$@" ;;
     * )
       log "Unknown Subcommand: ${_subcmd}"
       return 1
