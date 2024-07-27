@@ -123,7 +123,7 @@ _network_init() {
   local _net; _net="$(_ipam_kv get "k=net")"
   local _prefix; _prefix="${_net##*/}"
   local _gtwy_ip; _gtwy_ip="$(_ipam_kv get "k=gatewayIP")"
-  # _sudo ip addr add "${_gtwy_ip}/${_prefix}" dev "${o[name]}" # TODO Uncomment when ready
+  _sudo ip addr add "${_gtwy_ip}/${_prefix}" dev "${o[name]}"
 
   local _host_vip; _host_vip="$(_ipam_kv get "k=hostIP")"
   local _netsvc_vip; _netsvc_vip="$(_ipam_kv get "k=netsvcIP")"
