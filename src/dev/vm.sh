@@ -14,7 +14,7 @@ declare -r \
   builddir="${workdir}/build" \
   datadir="${workdir}/data"
 install -dm0750 "${workdir}" "${eventdir}" "${builddir}" "${datadir}"
-source "${CI_PROJECT_DIR}/src/_common.sh"
+source "${CI_PROJECT_DIR}/src/utils/000_import.sh"
 
 ### Functions ###
 
@@ -119,7 +119,7 @@ _network_init() {
   _sudo ip link add link "${_parent_inf}" name "${o[name]}" type macvlan mode bridge
   _kv set "k=inf" "v=${o[name]}"
 
-  log 'Assigning the Gateway Interface IP Address'
+  log 'Assigning the SDN Gateway Interface IP Address'
   local _net; _net="$(_ipam_kv get "k=net")"
   local _prefix; _prefix="${_net##*/}"
   local _gtwy_ip; _gtwy_ip="$(_ipam_kv get "k=gatewayIP")"
@@ -146,12 +146,17 @@ The Ruleset is relatively simple:
 DOC
   _sudo nft -f - <<NFT
 table ip ${o[name]} {
+  # Everytime a VM is created/destroyed we have to update this set
+  set sdn_ifnames {
+    type ifname
+    elements = { "${o[name]}" }
+  }
   # Mark the SDN Traffic & Jump to the SDN Chains
   chain mark_sdn {
     type filter hook prerouting priority mangle
     ip saddr ${_net} meta mark set ${o[fwmark]} return
     ip daddr ${_net} meta mark set ${o[fwmark]} return
-    iifname "${o[name]}" meta mark set ${o[fwmark]} return
+    iifname @sdn_ifnames meta mark set ${o[fwmark]} return
   }
   chain input {
     type filter hook input priority filter
@@ -177,15 +182,25 @@ table ip ${o[name]} {
   # Packet Filtering
   chain sdn_input {
     ct state { established, related } accept
+    # Eval NetSvcs Traffic in another chain
+    th dport { 53, 67, 68, 123 } jump sdn_netsvcs
     # Block all SDN Unicast Network Traffic, sourced from peers, Destined to the SDN Gateway IP
     ip saddr ${_net} ip daddr ${_gtwy_ip} ip saddr != ${_gtwy_ip} pkttype != { broadcast, multicast } drop
     # Allow all other SDN Traffic
     ip saddr ${_net} ct state new accept
+    log prefix "SDN Traffic: " flags all
     drop
+  }
+  chain sdn_netsvcs {
+    accept
+    ### TODO
+    # th dport { 53, 67, 68, 123 } ip daddr { ${_gtwy_ip}, ${_netsvc_vip} } accept
+    # drop
   }
   chain sdn_forward {
     ct state { established, related } accept
     ip saddr ${_net} ct state new accept
+    log prefix "SDN Traffic: " flags all
     drop
   }
   chain sdn_output {
@@ -296,7 +311,7 @@ _dnsmasq_gencfg() {
 ### The Server's Main Configuration ###
 
 # Socket Opts
-listen-address=$(_netkv get "k=gatewayIP") # Listen ONLY on the SDN Gateway IP
+listen-address=$(_ipamkv get "k=gatewayIP") # Listen ONLY on the SDN Gateway IP
 
 # DNS
 resolv-file=/etc/resolv.conf # Use the Host's DNS Servers
@@ -345,6 +360,25 @@ _dnsmasq_up() {
   install -m0640 /dev/null "${masqdir}/leases"
   _kv() { kv "$1" "d=${masqdir}/kv" "${@:2}"; }
 
+  case "$(_kv get "k=.status")" in
+    up ) log 'dnsmasq already running'; return 0 ;;
+    down | "" ) : ;; # Do Nothing
+    * ) log 'Unknown dnsmasq Status'; return 1 ;;
+  esac
+
+  ### TODO: Keep after development?
+
+  log 'Sanity Checks'
+  # Check if there is a dnsmasq process running
+  ! _kv get "k=pid" &>/dev/null || {
+    ! proc test "pid=$(_kv get "k=pid")" || {
+      log 'There is already a dnsmasq instance running'
+      return 1
+    }
+  }
+
+  ###
+
   _dnsmasq_gencfg || { log 'Failed to Generate dnsmasq Configs'; return 1; }
 
   local dnsmasq="${o[bin]:-}"; [[ -n "${dnsmasq:-}" ]] || dnsmasq="$(command -v dnsmasq)"
@@ -358,19 +392,40 @@ _dnsmasq_up() {
   }
 
   log 'Running dnsmasq'
-  local -a _argv=(
+  local -A _dnsmasq_res _dnsmasq_env
+  # Merge current envvars w/ dnsmasq
+  mapfile -t curenv < <( env | sort );
+  for kre in \
+    '^PATH' \
+    '^LC_' \
+    '^LANG' \
+  ; do
+    mapfile -t filterenv < <( str filter "${kre}=" "${curenv[@]}" )
+    for line in "${filterenv[@]}"; do
+      local k="${line%%=*}" v="${line#*=}"
+      _dnsmasq_env["${k}"]="${v}"
+    done
+  done
+  log "Using the Following Env for DNSMasq: $(declare -p _dnsmasq_env)"
+  local -a _dnsmasq_argv=(
     --keep-in-foreground
     --dhcp-leasefile="${masqdir}/leases"
     # TODO: --dhcp-script="${masqdir}/dhcp-lease.sh"
     --conf-file="${masqdir}/main.conf"
   )
-  _sudo "${dnsmasq}" "${_argv[@]}" &>"${masqdir}/dnsmasq.log" &
-  local _pid="$!"
-  kill -0 "${_pid}" || {
-    log 'Failed to Start dnsmasq'
-    return 1
-  }
-  _kv set "k=pid" "v=$!"
+  proc start \
+    name=dnsmasq \
+    result=_dnsmasq_res \
+    "cmd=${dnsmasq}" \
+    argv=_dnsmasq_argv \
+    env=_dnsmasq_env \
+    workdir="${masqdir}" \
+    stdout="${masqdir}/dnsmasq.log" \
+    stderr="${masqdir}/dnsmasq.log" \
+    uid=0 gid=0
+  _kv set "k=pid" "v=${_dnsmasq_res[pid]}"
+  _kv set "k=pgid" "v=${_dnsmasq_res[pgid]}"
+  _kv set "k=.status" "v=up"
 }
 _dnsmasq_down() {
   log 'Bringing Down the dnsmasq Server'
@@ -380,10 +435,12 @@ _dnsmasq_down() {
 
   local _pid; _pid="$(_kv get "k=pid")" || {
     log 'dnsmasq not running'
+    _kv set "k=.status" "v=down"
     return 0
   }
-  proc status "pid=${_pid}" || {
+  proc test "pid=${_pid}" || {
     log 'dnsmasq not running'
+    _kv set "k=.status" "v=down"
     return 0
   }
   log 'Killing dnsmasq'
@@ -391,6 +448,7 @@ _dnsmasq_down() {
     log 'Failed to Stop dnsmasq'
     return 1
   }
+  _kv set "k=.status" "v=down"
 }
 _chrony_up() {
   log 'Bringing Up the Chrony Server'
