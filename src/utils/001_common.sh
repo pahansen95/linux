@@ -31,6 +31,12 @@ merge_kv() {
   done
 }
 
+### Miscellaneous ###
+
+_assert() { eval "${1:?Missing Assertion Statement}" || { log "Assertion Failed: ${1}"; return 1; }; }
+boot_id() { awk '/btime/ {print $2}' /proc/stat | md5sum | awk '{print $1}'; }
+pgid() { ps -o pgid= "${1:?Missing PID}" | awk '{print $1}'; }
+
 ### Event Handling ###
 
 set_event() { install -m0644 /dev/null "${eventdir}/${1}" ; }
@@ -76,10 +82,23 @@ _str_filter() {
   [[ "$#" -ge 1 ]] || { log "Expected at least 1 string to filter"; return 1; }
   printf '%s\n' "$@" | awk -v re="${_re}" '$0 ~ re'
 }
+_str_rand() {
+  local -i _len="${1:?Missing Length}"; shift 1
+  [[ "${_len}" -gt 0 ]] || { log "Length must be in range [0, inf]"; return 1; }
+  until [[ "${#_str}" -ge "${_len}" ]]; do
+    _str+="$(
+      md5sum <(
+        printf '%s' "${EPOCHSECONDS}"
+        dd if=/dev/urandom bs=32 count=1 status=none
+      ) | awk '{ print $1 }'
+    )"
+  done
+  awk -v "len=${_len}" '{ print substr($1, 0, len) }' <<< "${_str}"
+}
 str() {
   local _subcmd="${1:?Missing Subcommand}"; shift 1
   case "${_subcmd}" in
-    join|split|filter ) "_str_${_subcmd}" "$@" ;;
+    join|split|filter|rand ) "_str_${_subcmd}" "$@" ;;
     * )
       log "Unknown Subcommand: ${_subcmd}"
       return 1
