@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 
-(return 0 &>/dev/null) || { echo 'MUST BE SOURCED!'; exit 1; }
+(return 0 &>/dev/null) || { printf '%s\n' "this script must be sourced: ${BASH_SOURCE[0]}"; exit 1; }
 
-: "${CI_PROJECT_DIR:?Missing CI_PROJECT_DIR}"
 : "${workdir:?Missing workdir}"
 : "${eventdir:?Missing eventdir}"
 
-log() { printf '%b\n' "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $*" >&2; }
+log() { printf '%b\n' "[$(date +'%Y-%m-%dT%H:%M:%S%z')]::$*" >&2; }
 check_root() { [[ "$(id -u)" -eq 0 ]] || { log "user is not root"; return 1; }; }
 can_sudo() { sudo -n true &>/dev/null || { log "user cannot sudo"; return 1; }; }
 _sudo() { if check_root &>/dev/null; then "$@"; else { can_sudo && sudo "$@"; }; fi; }
@@ -44,13 +43,37 @@ _str_join() {
   printf '%s\n' "$@" | awk '{printf "%s%s", sep, $0; sep=FS}' FS=':'
 }
 _str_split() {
-  local _sep="${1:?Missing Separator}"; shift 1
-  [[ "$#" -le 1 ]] || { log "Expected exactly 2 args"; return 1; }
-  printf %s "${1}" | awk -v sep="${_sep}" '{n=split($0, a, sep); for (i=1; i<=n; i++) print a[i]}'
+  local -A o=(
+    [sep]= # The Separator to Split on
+    [str]= # The String to Split
+    [max]=0 # The Maximum Number of Splits; 0 implies no limit
+  ); parse_kv o "$@"
+  printf %s "${o[str]}" | awk -v sep="${o[sep]}" -v max="${o[max]}" '
+  # Treat the whole document as a single string instead of evaluating each line
+  BEGIN { RS = "^$" }
+  {
+    # Find every Index of the seperator up to max times (or unlimited if max is 0)
+    start = 1
+    split_count = 0
+    while (1) {
+      split_pos = index(substr($0, start), sep)
+      
+      # Break if no more separators found or max splits reached (if max > 0)
+      if (split_pos == 0 || (max > 0 && split_count == max)) break
+      
+      # print the substrings, one per line, inbetween each split index
+      print substr($0, start, split_pos - 1)
+      start += split_pos + length(sep) - 1
+      split_count++
+    }
+    # Print the remaining part of the string
+    print substr($0, start)
+  }
+  '
 }
 _str_filter() {
   local _re="${1:?Missing Regular Expression}"; shift 1
-  [[ "$#" -le 1 ]] || { log "Expected exactly 2 args"; return 1; }
+  [[ "$#" -ge 1 ]] || { log "Expected at least 1 string to filter"; return 1; }
   printf '%s\n' "$@" | awk -v re="${_re}" '$0 ~ re'
 }
 str() {
@@ -84,14 +107,19 @@ _kv_get() {
   local -A o=(
     [d]= # The Directory to Store the KV
     [k]= # The Key
+    [v]= # The Default Value if the Key does not exist
   ); parse_kv o "$@"
-  [[ -f "${o[d]}/${o[k]}" ]] || return 1
+  [[ -f "${o[d]}/${o[k]}" ]] || {
+    [[ -n "${o[v]:-}" ]] || return 1
+    printf '%s\n' "${o[v]}"
+    return 0
+  }
   cat "${o[d]}/${o[k]}"
 }
 _kv_clear() {
   local -A o=(
     [d]= # The Directory to Store the KV
-    [k]= # The Key
+    [k]= # The Key to clear
   ); parse_kv o "$@"
   [[ ! -f "${o[d]}/${o[k]}" ]] || unlink "${o[d]}/${o[k]}"
 }
@@ -169,7 +197,8 @@ inet4() {
 
 ### Process & Concurrency Tools ###
 
-_proc_status() {
+_proc_pgid() { ps -o pgid= -p "${1:?Missing Process ID}" | awk '{ print $1; }'; }
+_proc_test() {
   local -A o=(
     [pid]= # The PID to Check
   ); parse_kv o "$@"
@@ -199,10 +228,156 @@ _proc_stop() {
     }
   }
 }
+_proc_start() {
+  # Run a process in the background
+  local -A o=(
+    [name]= # The Name of the Process
+    [result]= # An Associative Array name to store the results of spawning the process (on success only)
+    [cmd]= # The Command to run
+    [argv]= # An Array name holding the Arguments to pass to the command
+    [env]= # An Associative Array name holding the Environment Variables to set; by default, the current environment is used
+    [workdir]= # The Working Directory for the Command; defaults to the current working directory
+    [stdin]= # The File to use as stdin; defaults to /dev/null
+    [stdout]= # The File to write stdout to; defaults to $PWD/name.stdout
+    [stderr]= # The File to write stderr to; defaults to $PWD/name.stderr
+    [uid]= # The User ID to run the command as; defaults to the calling process's UID
+    [gid]= # The Group ID to run the command as; defaults to the calling process's GID
+  ); parse_kv o "$@"
+
+  # Sanity Checks & Set Defaults
+  [[ -n "${o[name]}" ]] || { log "Missing Name"; return 1; }
+  [[ -n "${o[result]}" ]] || { log "(Proc ${o[name]}) Missing Result Variable"; return 1; }
+  [[ -n "${o[cmd]}" ]] || { log "(Proc ${o[name]}) Missing Command"; return 1; }
+  [[ -n "${o[workdir]}" ]] || o[workdir]="${PWD}"
+  [[ -n "${o[stdin]}" ]] || o[stdin]="/dev/null"
+  [[ -n "${o[stdout]}" ]] || o[stdout]="${PWD}/${o[name]}.stdout"
+  [[ -n "${o[stderr]}" ]] || o[stderr]="${PWD}/${o[name]}.stderr"
+  [[ -n "${o[uid]}" ]] || o[uid]="$(id -u)"
+  [[ -n "${o[gid]}" ]] || o[gid]="$(id -g)"
+  [[ -n "${o[env]}" ]] || {
+    mapfile -t < <( env | sort )
+    local -A _current_env; parse_kv _current_env "${MAPFILE[@]}"
+    o[env]="_current_env"
+  }
+  [[ -n "${o[argv]:-}" ]] || { local -a _emtpy_argv=(); o[argv]="_emtpy_argv"; }
+ 
+  # Deference Variables
+  local -n _fn_nr_argv="${o[argv]}"
+  local -n _fn_nr_env="${o[env]}"
+  local -n _fn_nr_result="${o[result]}"
+
+  # Setup the Output Files
+  [[ -d "${o[workdir]}" ]] || install -dm0750 "${o[workdir]}"
+  [[ -e "${o[stdin]}" ]] || { log "(Proc ${o[name]}) stdin not found: ${o[stdin]}"; return 1; }
+  [[ -e "${o[stdout]}" ]] || install -m0640 /dev/null "${o[stdout]}"
+  [[ -e "${o[stderr]}" ]] || install -m0640 /dev/null "${o[stderr]}"
+
+  log "(Proc ${o[name]}) Spawning Background Process ${o[cmd]}"
+  (
+    # Variable Initialization
+    local -A v=(
+      [pid]=
+      [pgid]=
+      [cwd]="${o[workdir]}"
+      [stdin]="${o[stdin]}"
+      [stdout]="${o[stdout]}"
+      [stderr]="${o[stderr]}"
+    )
+    # Sanity Checks
+    [[ -d "${o[workdir]}" ]] || { log "(Proc ${o[name]}) workdir Not Found: ${o[workdir]}"; exit 127; }
+    [[ -e "${o[stdin]}" ]] || { log "(Proc ${o[name]}) stdin Not Found: ${o[stdin]}"; exit 127; }
+    [[ -e "${o[stdout]}" ]] || { log "(Proc ${o[name]}) stdout Not Found: ${o[stdout]}"; exit 127; }
+    [[ -e "${o[stderr]}" ]] || { log "(Proc ${o[name]}) stderr Not Found: ${o[stderr]}"; exit 127; }
+    
+    # Assemble the Env
+    mapfile -t envvars < <(
+      for _key in "${!_fn_nr_env[@]}"; do
+        printf '%s=%s\n' "${_key}" "${_fn_nr_env[${_key}]}"
+      done
+    )
+
+    # Setup Signal Handling
+    _handle_sig() {
+      local s="${1:?Missing Signal}"; shift 1
+      log "(Proc ${o[name]}) Received Signal: ${s}"
+      case "${s}" in
+        # The child process has terminated, stoped or has resumed
+        CHLD)
+          [[ -n "${v[pid]:-}" ]] || { log "(Proc ${o[name]}) No Process to Signal"; return 1; }
+          kill -0 "${v[pid]}" &>/dev/null || {
+            log "(Proc ${o[name]}) Child Process ${v[pid]} has Terminated"
+            exit 0
+          }
+          log "(Proc ${o[name]}) TODO: Child Process ${v[pid]} still exists"
+          ;;
+        # Terminate the Process Group
+        QUIT|TERM|INT)
+          [[ -n "${v[pgid]:-}" ]] || { log "(Proc ${o[name]}) No Process Group to Signal"; return 1; }
+          log "(Proc ${o[name]}) Terminating Process Group ${v[pgid]}"
+          kill -TERM -"${v[pgid]}"
+          ;;
+        # Passthrough the Signal to the Root Process
+        *)
+          [[ -n "${v[pid]:-}" ]] || { log "(Proc ${o[name]}) No Process to Signal"; return 1; }
+          log "(Proc ${o[name]}) Passthrough Signal ${v[pid]}"
+          kill -$s "${v[pid]}"
+          ;;
+      esac
+    }
+    for i in {1..31}; do trap "_handle_sig $(kill -l $i)" "${i}"; done
+
+    # Run the command in the background
+    local _sync; _sync="$(mktemp)"
+    local -a _setsid=( setsid --fork )
+    local -a _env=( env --ignore-environment "${envvars[@]}" )
+    local -a _run=(
+      sudo --non-interactive
+      --preserve-env --chdir="${o[workdir]}"
+      --user="${o[uid]}" --group="${o[gid]}"
+      --
+    )
+    local _cmd=( "${_setsid[@]}" "${_env[@]}" "${_run[@]}" "${o[cmd]}" "${_fn_nr_argv[@]}" )
+    (
+      while [[ -f "${_sync}" ]]; do sleep 0.1; done
+      log "(Proc ${o[name]}) Running Command: ${_cmd[*]}"
+      exec "${_cmd[@]}"
+    ) <"${o[stdin]}" >>"${o[stdout]}" 2>>"${o[stderr]}" &
+    v[pid]=$!
+    v[pgid]="$(_proc_pgid "${v[pid]}")"
+    disown "${v[pid]}"
+
+    # Wait for the command to exit
+    log "(Proc ${o[name]}) Removing Sync File"
+    unlink "${_sync}"
+    log "(Proc ${o[name]}) Waiting for Process ${v[pid]} to exit"
+    tail --pid="${v[pid]}" -f /dev/null
+  ) &
+  local _pid=$!
+  # Make sure the command started
+  kill -0 "${_pid}" &>/dev/null || {
+    log "(Proc ${o[name]}) Failed to start Background Process"
+    return 1
+  }
+  # Disown the process
+  disown "${_pid}"
+
+  # Record Process information
+  local _pgid; _pgid="$(_proc_pgid "${_pid}")"
+
+  _fn_nr_result+=(
+    [pid]="${_pid}"
+    [pgid]="${_pgid}"
+    [cwd]="$(readlink -f "${o[workdir]}")"
+    [stdin]="${o[stdin]}"
+    [stdout]="${o[stdout]}"
+    [stderr]="${o[stderr]}"
+  )
+
+}
 proc() {
   local _subcmd="${1:?Missing Subcommand}"; shift 1
   case "${_subcmd}" in
-    stop|status ) "_proc_${_subcmd}" "$@" ;;
+    start|stop|test|pgid ) "_proc_${_subcmd}" "$@" ;;
     * )
       log "Unknown Subcommand: ${_subcmd}"
       return 1
@@ -217,7 +392,7 @@ clean_dirs() {
     elevate=false # Whether to elevate the command
     dirs= # The Directories to Clean as a `:` separated list
   ); parse_kv _o "$@"
-  local -a _dirs; mapfile -t _dirs < <(str split ':' "${_o[dirs]}")
+  local -a _dirs; mapfile -t _dirs < <(str split sep=: "str=${_o[dirs]}")
   [[ "${#_dirs[@]}" -gt 0 ]] || {
     log "No Directories Specified"
     return 1
