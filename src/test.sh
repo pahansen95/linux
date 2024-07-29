@@ -152,6 +152,8 @@ schedule_tests() {
   : # TODO
 }
 
+### Main
+
 install -dm0755 "${CI_PROJECT_DIR:?Env Var CI_PROJECT_DIR not set}/.cache/tests"
 declare -A argv=(
   [search]="${CI_PROJECT_DIR}/src/utils"
