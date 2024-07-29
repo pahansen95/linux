@@ -46,7 +46,7 @@ get_event() { [[ -f "${eventdir}/${1}" ]]; }
 ### String Tools ###
 _str_join() {
   local _sep="${1:?Missing Separator}"; shift 1
-  printf '%s\n' "$@" | awk '{printf "%s%s", sep, $0; sep=FS}' FS=':'
+  printf '%s\n' "$@" | awk -v FS="$_sep" '{printf "%s%s", (NR>1 ? FS : ""), $0}'
 }
 _str_split() {
   local -A o=(
