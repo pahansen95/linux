@@ -6,14 +6,12 @@
 }
 
 test_proc() {
-  echo "hello world!"
+  local eventdir="${PWD}/.events"
+  source "${CI_PROJECT_DIR}/src/utils/000_import.sh"
+  log "hello world!"
 }
 
 ### Register the tests to run
-[[ -v TEST_REGISTRY ]] || {
-  _log "Can't find the Test Registry"
-  return 1
-}
 TEST_REGISTRY+=(
   [test_proc]="$( testdef factory fn=test_proc )"
 )
