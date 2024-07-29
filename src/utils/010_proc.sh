@@ -174,8 +174,8 @@ _controller_monitor() {
       esac
       case "${#opts[@]}" in
         0 ) _emit "${event}" ;;
-        1 ) _emit "${event}" "${opts[0]}"
-        * ) _emit "${event}" "$(str join "${_IS}" "${opts[@]}")"
+        1 ) _emit "${event}" "${opts[0]}" ;;
+        * ) _emit "${event}" "$(str join "${_IS}" "${opts[@]}")" ;;
       esac
     done
   }
@@ -239,11 +239,12 @@ _controller_loop() {
       QUIT | INT ) _svc_kill TERM ;;
       TERM ) _svc_kill KILL ;;
       STOP | STP | CONT | CHLD | CLD ) log 'Ignoring Signal' ;;
-      * ) _svc_kill "$s" ;;
+      * ) log 'Signal Suppressed' ;; # TODO: Should we suppress or passthrough?
+      # * ) _svc_kill "$s" ;;
     esac
   }
 
-  _assert "[[ ${svc_timeout} -le 0 ]]"
+  _assert "[[ ${svc_timeout} -le 0 ]]" # TODO: Implement Timeouts for Services
   local gate="${o[statedir]}/.svcgate"; install -m0640 /dev/null "${gate}"
   (
     # Wait until the Parent opens the gate
